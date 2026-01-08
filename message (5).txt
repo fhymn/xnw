@@ -1,0 +1,2341 @@
+--!optimize 2
+
+-- Who's AP? w6lv (UI By X)
+local function VectorMagnitude(v)
+    return math.sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z)
+end
+
+_G.GetBallVelocity = function(ball)
+    if not ball then return vector.create(0, 0, 0) end
+    local success, velocity = pcall(function() return ball.Velocity end)
+    return (success and velocity) or vector.create(0, 0, 0)
+end
+
+local MAX = math.max
+local MIN = math.min
+
+local Keybinds = {
+    ToggleAutoParry = nil,
+    ToggleAutoclicker = nil,
+}
+
+-- AUTOCLICKER SETTINGS
+local AutoclickerSettings = {
+    Mode = "hold",  -- "hold" or "toggle"
+    ClickInterval = 0.016,
+}
+
+local Config = {
+    AutoParryEnabled = false,
+    DirectionCheckEnabled = true,
+    IgnoreDirectionAtCloseRange = true,
+    CloseRangeDistance = 35,
+    
+    BaseParryTime = 0.47,
+    ParryBufferDistance = 5,
+    PingCompensation = 0.5,
+    MinParrySpeed = 3,
+    ParryAggressiveness = 1.0,
+    
+    UseDistanceSpeedCorrelation = true,
+    DistanceSpeedRanges = {
+        {0, 20, 0.88, 0.00008},
+        {20, 40, 0.92, 0.00010},
+        {40, 60, 0.96, 0.00012},
+        {60, 85, 1.02, 0.00014},
+        {85, 999, 1.08, 0.00016},
+    },
+    
+    ProgressiveDistanceEnabled = true,
+    ProgressiveDistanceRanges = {
+        {15, 2.5},
+        {25, 2.0},
+        {35, 1.6},
+        {50, 1.3},
+        {70, 1.1},
+        {999, 1.0},
+    },
+    
+    DynamicClickRates = true,
+    ClickRateZones = {
+        {12, 5, 3},
+        {20, 4, 5},
+        {30, 3, 10},
+        {45, 2, 20},
+        {65, 1, 35},
+        {999, 1, 50},
+    },
+    
+    SpeedBasedRapidParry = true,
+    SpeedRapidParryTiers = {
+        {500, 80},
+        {700, 100},
+        {900, 120},
+        {1100, 150},
+    },
+    
+    AutoPopAbilities = {
+        DefensivePopTiming = 0.3,
+        OffensivePopDelay = 0.0,
+        
+        Infinity = { enabled = true },
+        RagingDeflection = { enabled = true },
+        CalmingDeflection = { enabled = true },
+        Singularity = { enabled = true, useOnParry = true },
+        AerodynamicSlash = { enabled = true, useOnParry = true },
+        Rapture = { enabled = true, useOnParry = true },
+        DeathSlash = { 
+            enabled = true, 
+            useOnParry = true,
+            qteEnabled = true,
+            qteDelay = 2.45,  -- Changed from 0.85 to 2.45
+            qtePressCount = 1,
+        },
+        SlashOfFury = {
+            enabled = true,
+            useOnParry = true,  -- Use like Singularity - activate ahead of ball
+            clickCount = 38,
+            clickDelay = 0.1,
+            prepareForReturn = true,
+            -- Distance settings for when to activate
+            activateMaxDistance = 100,  -- Activate when ball <= 100 studs
+            activateMinDistance = 40,   -- Don't activate if too close (< 40)
+            activateMinSpeed = 150,     -- Only activate when ball speed >= 150
+        },
+    },
+    
+    -- AERODYNAMIC SLASH DEFENSE SETTINGS
+    AeroDefenseEnabled = true,
+    AeroDefense = {
+        useVFXDetection = true,             -- Use Ball VFX detection (most reliable)
+        useDynamicDelay = true,             -- Automatically adjust delay based on distance
+        baseParryDelay = 0.35,              -- Base delay (close range) - reduced
+        delayPerDistance = 0.002,           -- Add 0.002s per stud (reduced from 0.005)
+        minDelay = 0.25,                    -- Minimum delay
+        maxDelay = 0.75,                    -- Maximum delay (reduced from 1.2)
+        minSpeedForParry = 150,             -- Minimum speed when parrying
+        alignmentThreshold = 0.75,          -- Alignment requirement
+        debugMode = false,                  -- Minimal debug logging (not spammy)
+    },
+    
+    -- MARTYRDOM DETECTION SETTINGS
+    MartyrdomDetectionEnabled = true,
+    MartyrdomSafeDistance = 50,             -- Safe distance from explosions
+    MartyrdomExplosionDelay = 0.3,          -- Time after death before explosion
+    MartyrdomPreventDistance = 60,          -- Don't approach if player has Martyrdom
+    MartyrdomHealthThreshold = 30,          -- Consider dangerous if below this HP
+    MartyrdomDebugMode = false,             -- Minimal debug logging
+    
+    -- FREEZE & TELEKINESIS DETECTION
+    FreezeDetectionEnabled = true,
+    FreezeBallSpeedThreshold = 10,          -- Ball speed below this = frozen
+    FreezeMinDuration = 0.1,                -- Minimum time frozen to be considered a freeze
+    FreezeParryEnabled = true,              -- Allow parrying frozen balls
+    FreezeDebugMode = false,                -- Minimal debug logging
+    
+    TelekinesisDetectionEnabled = true,
+    TelekinesisVelocityThreshold = 400,     -- High velocity spike after telekinesis
+    TelekinesisParryDelay = 0.12,           -- React quickly after redirect
+    TelekinesisDebugMode = false,
+}
+
+local TBSettings = {
+    Enabled = false,
+    ClickDelay = 60,
+    LastClickTime = 0,
+    HasClicked = false,  -- Prevents double clicks per target session
+    Keybind = nil,
+}
+
+local ESPSettings = {
+    Enabled = true,
+    AbilityColor = Color3.fromRGB(255, 255, 255),
+    Opacity = 1,
+    TextSize = 14,
+}
+
+_G.AutoParryState = {
+    LocalPlayer = game:GetService("Players").LocalPlayer,
+    Clicked = false,
+    AutoclickerMode = false,
+    CachedCharacter = nil,
+    CachedHRP = nil,
+    CachedPlayerModel = nil,
+    CachedBallsFolder = nil,
+    CachedAliveFolder = nil,
+    ThreadRunning = true,
+    CompensatedParryTime = 0.47,
+    LastPingUpdate = 0,
+    BallData = {
+        isTargeted = false,
+        lastSpeed = 0,
+        speedHistory = {},
+        highestRecentSpeed = 0,
+        lastHighSpeedTime = 0,
+        lastDistance = 999,
+        lastBallPosition = nil,
+        approachVelocity = 0,
+        wasTargetedLastFrame = false,
+        ballExists = false,
+        ballRespawnTime = 0,
+    },
+    BallTracking = {
+        lastBallSpeed = 0,
+        lastCheckTime = 0,
+        lastBallDistance = 999,
+        peakSpeed = 0,
+        peakSpeedTime = 0,
+        speedSmoothWindow = 0.1,
+        
+        -- TARGET TRACKING
+        lastTargetedPlayer = nil,
+        lastTargetedPlayerAbility = nil,
+        speedBeforeSpike = 0,
+        spikeDetected = false,
+        spikeTime = 0,
+    },
+    
+    LastParryTime = 0,
+    DeathTracking = {
+        wasAlive = true,
+        lastDeathSpeed = 0,
+        lastDeathDistance = 0,
+        lastDeathMultiplier = 0,
+    },
+    DynamicClick = {
+        lastClickTime = 0,
+        clickCount = 0,
+    },
+    AbilityTracking = {
+        InfinityActive = false,
+        InfinityPauseUntil = 0,
+        InfinityCooldownUntil = 0,
+        SingularityEquipped = false,
+        SingularityCooldownUntil = 0,
+        SingularityDuration = 10,
+        SingularityCooldown = 18,
+        LastAbilityPress = 0,
+        SingularityCapeWasActive = false,
+        
+        EnemyUsedSingularity = false,
+        EnemyUsedInfinity = false,
+        DangerousAbilityDetectedTime = 0,
+        
+        LastAutoPop = 0,
+        LastDefensivePop = 0,
+        CurrentAbility = "",
+        LastAbilityCheck = 0,
+        
+        -- SLASH OF FURY TRACKING
+        SoFActive = false,
+        SoFStartTime = 0,
+        SoFPreparedForReturn = false,
+        
+        -- AERODYNAMIC SLASH DEFENSE TRACKING (VFX-based)
+        AeroVFXDetected = false,
+        AeroVFXDetectionTime = 0,
+        AeroTornadoStartTime = 0,
+        AeroUserPosition = nil,
+        AeroCalculatedDelay = 0.88,
+        
+        -- MARTYRDOM TRACKING
+        ActiveMartyrdoms = {},
+        LastPlayerStates = {},
+        PlayersWithMartyrdom = {},
+        LowHealthPlayers = {},
+        DangerZones = {},
+        
+        -- FREEZE TRACKING
+        BallFrozen = false,
+        FreezeStartTime = 0,
+        FreezeDetectedTime = 0,
+        FreezeJustExpired = false,
+        FreezeExpireTime = 0,
+        LastBallSpeed = 0,
+        
+        -- TELEKINESIS TRACKING
+        TelekinesisActive = false,
+        TelekinesisDetectedTime = 0,
+        TelekinesisTargetChanged = false,
+        PreTelekinesisTarget = nil,
+        
+        -- FREEZE & TELEKINESIS TRACKING
+        BallFrozen = false,
+        FreezeStartTime = 0,
+        LastBallSpeed = 0,
+        
+        TelekinesisActive = false,
+        TelekinesisRetargetTime = 0,
+        TelekinesisLastTarget = nil,
+        LastTargetCheck = 0,
+        
+        AbilityCooldowns = {
+            Infinity = 0,
+            RagingDeflection = 0,
+            CalmingDeflection = 0,
+            Singularity = 0,
+            AerodynamicSlash = 0,
+            Rapture = 0,
+            DeathSlash = 0,
+            SlashOfFury = 0,  -- SoF cooldown
+        },
+    }
+}
+
+if not _ESPAbilityCache then
+    _ESPAbilityCache = {}
+end
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+-- PING COMPENSATION
+task.spawn(function()
+    while task.wait(2.0) do
+        pcall(function()
+            local ping = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+            if ping and ping > 0 then
+                local compensation = (ping / 1000) * Config.PingCompensation
+                _G.AutoParryState.CompensatedParryTime = MAX(0.15, MIN(0.7, Config.BaseParryTime + compensation))
+            end
+        end)
+    end
+end)
+
+-- HELPER FUNCTIONS
+local function GetCurrentBall()
+    if _G.AutoParryState.CachedBallsFolder then
+        local children = _G.AutoParryState.CachedBallsFolder:GetChildren()
+        return children and children[1]
+    end
+    return nil
+end
+
+local function GetPlayerPosition()
+    if _G.AutoParryState.CachedHRP then
+        return _G.AutoParryState.CachedHRP.Position
+    end
+    return nil
+end
+
+local function IsTargeted()
+    return _G.AutoParryState.CachedPlayerModel and _G.AutoParryState.CachedPlayerModel:FindFirstChild("Highlight") ~= nil
+end
+
+-- Direct highlight check for SoF (doesn't use cache)
+local function IsTargetedDirect()
+    local aliveFolder = workspace:FindFirstChild("Alive")
+    if not aliveFolder then return false end
+    
+    local playerModel = aliveFolder:FindFirstChild(_G.AutoParryState.LocalPlayer.Name)
+    if not playerModel then return false end
+    
+    return playerModel:FindFirstChild("Highlight") ~= nil
+end
+
+local function IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
+    local toPlayer = playerPos - ballPos
+    return (toPlayer.X * ballVel.X + toPlayer.Y * ballVel.Y + toPlayer.Z * ballVel.Z) > 0
+end
+
+local function ShouldCheckDirection(distance)
+    if not Config.DirectionCheckEnabled then return false end
+    if Config.IgnoreDirectionAtCloseRange and distance <= 60 then return false end
+    return true
+end
+
+local function HasSingularityCape()
+    local character = _G.AutoParryState.LocalPlayer.Character
+    if character then
+        local primaryPart = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+        if primaryPart and primaryPart:FindFirstChild("SingularityCape") then
+            return true
+        end
+    end
+    return false
+end
+
+-- GET CURRENT BALL TARGET (who has the highlight)
+local function GetCurrentBallTarget()
+    local aliveFolder = workspace:FindFirstChild("Alive")
+    if not aliveFolder then return nil, nil end
+    
+    for _, character in aliveFolder:GetChildren() do
+        if character:FindFirstChild("Highlight") then
+            -- Found targeted player
+            local playerName = character.Name
+            local player = Players:FindFirstChild(playerName)
+            local ability = nil
+            
+            if player then
+                ability = player:GetAttribute("EquippedAbility")
+            end
+            
+            if not ability then
+                ability = character:GetAttribute("EquippedAbility")
+            end
+            
+            return playerName, ability and tostring(ability) or nil
+        end
+    end
+    
+    return nil, nil
+end
+
+-- GET AERO USER POSITION AND CALCULATE DELAY
+local function FindAeroUserAndCalculateDelay()
+    local aliveFolder = workspace:FindFirstChild("Alive")
+    if not aliveFolder then return nil, 0.88 end
+    
+    local localName = _G.AutoParryState.LocalPlayer.Name
+    local playerPos = GetPlayerPosition()
+    if not playerPos then return nil, 0.88 end
+    
+    -- Find player with Aerodynamic Slash ability who is NOT us
+    for _, character in aliveFolder:GetChildren() do
+        if character.Name ~= localName then
+            local player = Players:FindFirstChild(character.Name)
+            if player then
+                local ability = player:GetAttribute("EquippedAbility")
+                if ability then
+                    local abilityStr = tostring(ability):lower()
+                    if abilityStr:find("aerodynamic") or abilityStr:find("aero") then
+                        -- Found Aero user - get their position
+                        local enemyHRP = character:FindFirstChild("HumanoidRootPart")
+                        if enemyHRP then
+                            local enemyPos = enemyHRP.Position
+                            local distance = VectorMagnitude(enemyPos - playerPos)
+                            
+                            -- Calculate dynamic delay based on distance
+                            local aeroConfig = Config.AeroDefense
+                            if aeroConfig.useDynamicDelay then
+                                local calculatedDelay = aeroConfig.baseParryDelay + (distance * aeroConfig.delayPerDistance)
+                                calculatedDelay = MAX(aeroConfig.minDelay, MIN(aeroConfig.maxDelay, calculatedDelay))
+                                
+                                if aeroConfig.debugMode then
+                                    print(string.format("🌪️ Aero: %s | D:%d | Delay:%.2fs", 
+                                        character.Name, math.floor(distance), calculatedDelay))
+                                end
+                                
+                                return enemyPos, calculatedDelay
+                            else
+                                return enemyPos, aeroConfig.baseParryDelay
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    -- No Aero user found - use default
+    return nil, Config.AeroDefense.baseParryDelay or 0.88
+end
+
+-- MARTYRDOM DETECTION FUNCTIONS
+
+local function GetPlayerHealth(player)
+    if not player or not player.Character then return 0 end
+    local humanoid = player.Character:FindFirstChild("Humanoid")
+    return humanoid and humanoid.Health or 0
+end
+
+local function HasMartyrdomAbility(player)
+    if not player or not player.Character then return false end
+    
+    -- Check character for Martyrdom ability
+    if player.Character:FindFirstChild("Martyrdom") then
+        return true
+    end
+    
+    -- Check backpack
+    local backpack = player:FindFirstChild("Backpack")
+    if backpack and backpack:FindFirstChild("Martyrdom") then
+        return true
+    end
+    
+    -- Check player attribute
+    local ability = player:GetAttribute("EquippedAbility")
+    if ability then
+        local abilityStr = tostring(ability):lower()
+        if abilityStr:find("martyrdom") then
+            return true
+        end
+    end
+    
+    return false
+end
+
+local function GetDistanceToPlayer(playerCharacter)
+    if not playerCharacter then return math.huge end
+    
+    local myPos = GetPlayerPosition()
+    if not myPos then return math.huge end
+    
+    local targetHRP = playerCharacter:FindFirstChild("HumanoidRootPart")
+    if not targetHRP then return math.huge end
+    
+    return VectorMagnitude(targetHRP.Position - myPos)
+end
+
+local function TrackMartyrdomExplosion(playerName, deathPosition, deathTime)
+    if not Config.MartyrdomDetectionEnabled then return end
+    
+    local explosionData = {
+        position = deathPosition,
+        time = deathTime,
+        explodeTime = deathTime + Config.MartyrdomExplosionDelay,
+        radius = Config.MartyrdomSafeDistance
+    }
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    tracking.ActiveMartyrdoms[playerName] = explosionData
+    tracking.DangerZones[playerName] = explosionData
+    
+    if Config.MartyrdomDebugMode then
+        print(string.format("💀 Martyrdom: %s died at distance %.1f", playerName, 
+            VectorMagnitude(deathPosition - GetPlayerPosition())))
+    end
+end
+
+local function IsInMartyrdomDangerZone()
+    if not Config.MartyrdomDetectionEnabled then return false end
+    
+    local myPos = GetPlayerPosition()
+    if not myPos then return false end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    
+    -- Check all danger zones
+    for playerName, zone in pairs(tracking.DangerZones) do
+        local distance = VectorMagnitude(zone.position - myPos)
+        
+        if distance <= zone.radius then
+            return true, playerName, distance
+        end
+    end
+    
+    return false
+end
+
+local function IsNearLowHealthMartyrdom()
+    if not Config.MartyrdomDetectionEnabled then return false end
+    
+    local myPos = GetPlayerPosition()
+    if not myPos then return false end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    
+    -- Check for low health players with Martyrdom
+    for playerName, data in pairs(tracking.LowHealthPlayers) do
+        if data.hasMartyrdom and data.health > 0 and data.health < Config.MartyrdomHealthThreshold then
+            local distance = data.distance
+            if distance <= Config.MartyrdomPreventDistance then
+                return true, playerName, data.health, distance
+            end
+        end
+    end
+    
+    return false
+end
+
+local function CheckMartyrdomDanger()
+    if not Config.MartyrdomDetectionEnabled then return false, nil end
+    
+    local currentTime = tick()
+    local myPos = GetPlayerPosition()
+    
+    if not myPos then return false, nil end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    
+    -- First check: immediate danger zones
+    local inZone, zoneName, zoneDistance = IsInMartyrdomDangerZone()
+    if inZone then
+        return true, { type = "zone", name = zoneName, distance = zoneDistance }
+    end
+    
+    -- Second check: low health Martyrdom players nearby
+    local nearLowHealth, playerName, health, distance = IsNearLowHealthMartyrdom()
+    if nearLowHealth then
+        return true, { type = "low_health", name = playerName, health = health, distance = distance }
+    end
+    
+    -- Third check: active explosions
+    for playerName, martyrdomData in pairs(tracking.ActiveMartyrdoms) do
+        if currentTime >= martyrdomData.explodeTime - 0.1 then
+            local distance = VectorMagnitude(martyrdomData.position - myPos)
+            
+            if distance <= Config.MartyrdomSafeDistance then
+                return true, { type = "explosion", name = playerName, distance = distance }
+            end
+            
+            -- Clean up expired martyrdoms
+            if currentTime >= martyrdomData.explodeTime + 1.0 then
+                tracking.ActiveMartyrdoms[playerName] = nil
+                tracking.DangerZones[playerName] = nil
+            end
+        end
+    end
+    
+    return false, nil
+end
+
+local function ShouldAvoidMartyrdom()
+    local inDanger, dangerData = CheckMartyrdomDanger()
+    
+    if inDanger and dangerData and Config.MartyrdomDebugMode then
+        if dangerData.type == "zone" then
+            print(string.format("💀 Danger Zone: %s (%.1fm)", dangerData.name, dangerData.distance))
+        elseif dangerData.type == "low_health" then
+            print(string.format("💀 Low HP: %s (%.0fHP, %.1fm)", dangerData.name, dangerData.health, dangerData.distance))
+        elseif dangerData.type == "explosion" then
+            print(string.format("💀 Explosion: %s (%.1fm)", dangerData.name, dangerData.distance))
+        end
+    end
+    
+    return inDanger
+end
+
+-- FREEZE & TELEKINESIS DETECTION FUNCTIONS
+
+local function DetectBallFreeze(currentSpeed, currentTime)
+    if not Config.FreezeDetectionEnabled then return end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    
+    -- Detect ball becoming frozen (speed drops to exactly 0 or near 0)
+    if currentSpeed <= 2 and tracking.LastBallSpeed > 10 then
+        tracking.BallFrozen = true
+        tracking.FreezeStartTime = currentTime
+        
+        -- CRITICAL: Reset clicked flag so we can parry after unfreeze
+        _G.AutoParryState.Clicked = false
+        
+        if Config.FreezeDebugMode then
+            print(string.format("❄️ Ball frozen (speed: %.1f) - RESET clicked flag", currentSpeed))
+        end
+    end
+    
+    -- EARLY FREEZE DETECTION: If speed is dropping rapidly (freeze starting)
+    if not tracking.BallFrozen and currentSpeed < 10 and tracking.LastBallSpeed > 50 then
+        -- Speed dropped dramatically - likely freezing
+        _G.AutoParryState.Clicked = false
+        
+        if Config.FreezeDebugMode then
+            print(string.format("❄️ Rapid speed drop detected (%.0f→%.0f) - RESET clicked", tracking.LastBallSpeed, currentSpeed))
+        end
+    end
+    
+    -- Detect ball unfreezing (speed resumes from frozen state)
+    if tracking.BallFrozen and currentSpeed > 50 then
+        local freezeDuration = currentTime - tracking.FreezeStartTime
+        
+        -- Set flag to resume normal parrying after unfreeze
+        tracking.BallFrozen = false
+        tracking.FreezeJustExpired = true
+        tracking.FreezeExpireTime = currentTime
+        
+        -- Ensure clicked flag is reset for unfreeze parry
+        _G.AutoParryState.Clicked = false
+        
+        if Config.FreezeDebugMode then
+            print(string.format("❄️ Freeze ended after %.2fs (speed now: %.0f) - RESET clicked, ready to parry", freezeDuration, currentSpeed))
+        end
+    end
+    
+    tracking.LastBallSpeed = currentSpeed
+end
+
+local function DetectTelekinesis(currentSpeed, currentTime)
+    if not Config.TelekinesisDetectionEnabled then return end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    
+    -- Detect telekinesis: Ball was frozen, now has high speed spike
+    if tracking.BallFrozen and currentSpeed >= Config.TelekinesisSpeedThreshold then
+        -- Check if target changed
+        local currentTarget = IsTargeted()
+        local targetChanged = currentTarget and currentTarget ~= tracking.TelekinesisLastTarget
+        
+        if targetChanged or (currentTime - tracking.LastTargetCheck) > 0.5 then
+            tracking.TelekinesisActive = true
+            tracking.TelekinesisRetargetTime = currentTime
+            tracking.TelekinesisLastTarget = currentTarget
+            tracking.BallFrozen = false
+            
+            if Config.TelekinesisDebugMode then
+                print(string.format("🔮 Telekinesis detected | Speed: %d | Retargeted", math.floor(currentSpeed)))
+            end
+        end
+        
+        tracking.LastTargetCheck = currentTime
+    end
+    
+    -- Clear telekinesis flag after delay
+    if tracking.TelekinesisActive and (currentTime - tracking.TelekinesisRetargetTime) > 1.0 then
+        tracking.TelekinesisActive = false
+    end
+end
+
+local function ShouldParryFrozenBall()
+    if not Config.FreezeParryEnabled then return false end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    
+    -- Allow parrying if ball is frozen and we're targeted
+    if tracking.BallFrozen and IsTargeted() then
+        return true
+    end
+    
+    return false
+end
+
+local function ShouldDelayForTelekinesis(currentTime)
+    if not Config.TelekinesisDetectionEnabled then return false end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    
+    -- Delay parrying briefly after telekinesis retarget
+    if tracking.TelekinesisActive then
+        local timeSinceRetarget = currentTime - tracking.TelekinesisRetargetTime
+        
+        if timeSinceRetarget < Config.TelekinesisRetargetDelay then
+            if Config.TelekinesisDebugMode then
+                print(string.format("🔮 Waiting for telekinesis: %.2fs / %.2fs", timeSinceRetarget, Config.TelekinesisRetargetDelay))
+            end
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- FREEZE ABILITY DETECTION
+local function CheckFreezeAbility()
+    if not Config.FreezeDetectionEnabled then return false end
+    
+    local Ball = GetCurrentBall()
+    if not Ball then return false end
+    
+    local ballVel = _G.GetBallVelocity(Ball)
+    local currentSpeed = VectorMagnitude(ballVel)
+    local tracking = _G.AutoParryState.AbilityTracking
+    local currentTime = tick()
+    
+    -- Check if ball is frozen (very low speed)
+    if currentSpeed < Config.FreezeBallSpeedThreshold then
+        if not tracking.BallFrozen then
+            -- Ball just became frozen
+            tracking.BallFrozen = true
+            tracking.FreezeStartTime = currentTime
+            tracking.FreezeDetectedTime = currentTime
+            
+            if Config.FreezeDebugMode then
+                print(string.format("❄️ Freeze detected | Speed: %.1f", currentSpeed))
+            end
+        end
+        return true
+    else
+        -- Ball is no longer frozen
+        if tracking.BallFrozen then
+            local freezeDuration = currentTime - tracking.FreezeStartTime
+            
+            if freezeDuration >= Config.FreezeMinDuration then
+                if Config.FreezeDebugMode then
+                    print(string.format("❄️ Freeze ended | Duration: %.2fs", freezeDuration))
+                end
+            end
+            
+            tracking.BallFrozen = false
+        end
+        return false
+    end
+end
+
+-- TELEKINESIS ABILITY DETECTION
+local function CheckTelekinesisAbility()
+    if not Config.TelekinesisDetectionEnabled then return false end
+    
+    local Ball = GetCurrentBall()
+    if not Ball then return false end
+    
+    local ballVel = _G.GetBallVelocity(Ball)
+    local currentSpeed = VectorMagnitude(ballVel)
+    local tracking = _G.AutoParryState.AbilityTracking
+    local currentTime = tick()
+    
+    -- First check: Ball was frozen and now has high velocity spike
+    if tracking.BallFrozen and currentSpeed >= Config.TelekinesisVelocityThreshold then
+        -- Check if target changed
+        local currentTarget = nil
+        local aliveFolder = workspace:FindFirstChild("Alive")
+        if aliveFolder then
+            for _, character in aliveFolder:GetChildren() do
+                if character:FindFirstChild("Highlight") then
+                    currentTarget = character.Name
+                    break
+                end
+            end
+        end
+        
+        -- Telekinesis likely used if:
+        -- 1. Ball was frozen
+        -- 2. Now has high velocity
+        -- 3. Target may have changed (optional check)
+        if not tracking.TelekinesisActive then
+            tracking.TelekinesisActive = true
+            tracking.TelekinesisDetectedTime = currentTime
+            tracking.TelekinesisTargetChanged = (currentTarget ~= tracking.PreTelekinesisTarget)
+            
+            if Config.TelekinesisDebugMode then
+                print(string.format("🧠 Telekinesis detected | Speed: %.0f | Target: %s", 
+                    currentSpeed, currentTarget or "Unknown"))
+            end
+            
+            return true
+        end
+    end
+    
+    -- Reset telekinesis flag after some time
+    if tracking.TelekinesisActive and (currentTime - tracking.TelekinesisDetectedTime) > 2.0 then
+        tracking.TelekinesisActive = false
+    end
+    
+    -- Track previous target for telekinesis detection
+    if IsTargeted() then
+        tracking.PreTelekinesisTarget = _G.AutoParryState.LocalPlayer.Name
+    end
+    
+    -- Track last ball speed
+    tracking.LastBallSpeed = currentSpeed
+    
+    return tracking.TelekinesisActive
+end
+
+-- FREEZE PARRY CHECK
+local function ShouldParryFrozenBall()
+    if not Config.FreezeDetectionEnabled or not Config.FreezeParryEnabled then return false end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    local currentTime = tick()
+    
+    -- Allow parrying if:
+    -- 1. Ball is frozen
+    -- 2. We are targeted
+    -- 3. Small delay has passed since freeze detection
+    if tracking.BallFrozen and IsTargeted() then
+        local timeSinceFreeze = currentTime - tracking.FreezeDetectedTime
+        
+        if timeSinceFreeze >= Config.FreezeParryDelay then
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- TELEKINESIS PARRY CHECK
+local function ShouldParryTelekinesis()
+    if not Config.TelekinesisDetectionEnabled then return false end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    local currentTime = tick()
+    
+    -- Parry after telekinesis redirect if:
+    -- 1. Telekinesis was detected
+    -- 2. We are targeted
+    -- 3. Small delay has passed
+    if tracking.TelekinesisActive and IsTargeted() then
+        local timeSinceTelekinesis = currentTime - tracking.TelekinesisDetectedTime
+        
+        if timeSinceTelekinesis >= Config.TelekinesisParryDelay then
+            if Config.TelekinesisDebugMode then
+                print("🧠 Telekinesis parry triggered")
+            end
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- AERODYNAMIC SLASH VFX-BASED DETECTION
+local function CheckAeroSlashVFX()
+    if not Config.AeroDefenseEnabled or not Config.AeroDefense.useVFXDetection then
+        return false
+    end
+    
+    local Ball = GetCurrentBall()
+    if not Ball then return false end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    local currentTime = tick()
+    
+    -- DEBOUNCE: Don't re-detect if already detected recently (within 2 seconds)
+    if tracking.AeroVFXDetected and (currentTime - tracking.AeroVFXDetectionTime) < 2.0 then
+        return false
+    end
+    
+    -- Check if ball has AeroDynamicSlashVFX child
+    local hasVFX = Ball:FindFirstChild('AeroDynamicSlashVFX')
+    if hasVFX then
+        -- Only trigger if we haven't detected recently
+        if not tracking.AeroVFXDetected then
+            -- Find Aero user and calculate delay based on distance
+            local aeroUserPos, calculatedDelay = FindAeroUserAndCalculateDelay()
+            
+            -- Record tornado start time
+            tracking.AeroTornadoStartTime = currentTime
+            tracking.AeroVFXDetected = true
+            tracking.AeroVFXDetectionTime = currentTime
+            tracking.AeroUserPosition = aeroUserPos
+            tracking.AeroCalculatedDelay = calculatedDelay
+            
+            if Config.AeroDefense.debugMode then
+                print(string.format("🌪️ Aero detected | Delay: %.2fs", calculatedDelay))
+            end
+            
+            return true
+        end
+    end
+    
+    return false
+end
+
+local function IsWithinTornadoDuration()
+    local tracking = _G.AutoParryState.AbilityTracking
+    
+    if tracking.AeroTornadoStartTime == 0 then return false end
+    
+    local currentTime = tick()
+    local timeSinceTornado = currentTime - tracking.AeroTornadoStartTime
+    
+    -- Use generous window - tornado duration check was too strict
+    if timeSinceTornado < 2.5 then
+        if Config.AeroDefense.debugMode and math.random() < 0.02 then
+            print(string.format("🌪️ [AERO WINDOW] %.2fs / 2.5s", timeSinceTornado))
+        end
+        return true
+    end
+    
+    -- Reset if past reasonable duration
+    if timeSinceTornado > 3.0 then
+        tracking.AeroTornadoStartTime = 0
+        tracking.AeroVFXDetected = false
+    end
+    
+    return false
+end
+
+-- AERODYNAMIC SLASH PARRY CHECK (VFX-based)
+local function CheckAeroSlashParryVFX(ballPos, ballVel, playerPos, currentSpeed, currentTime)
+    if not Config.AeroDefenseEnabled or not Config.AeroDefense.useVFXDetection then
+        return false
+    end
+    
+    local tracking = _G.AutoParryState.AbilityTracking
+    local aeroConfig = Config.AeroDefense
+    
+    -- Must have detected VFX first
+    if not tracking.AeroVFXDetected then
+        return false
+    end
+    
+    -- Check if we're targeted now
+    if not IsTargeted() then
+        if aeroConfig.debugMode and math.random() < 0.1 then
+            print("🌪️ [NOT TARGETED] Aero detected but not targeted yet")
+        end
+        return false
+    end
+    
+    -- CRITICAL: WAIT for full delay after VFX detection (uses dynamic delay)
+    local timeSinceVFX = currentTime - tracking.AeroVFXDetectionTime
+    local requiredDelay = tracking.AeroCalculatedDelay or aeroConfig.baseParryDelay
+    
+    if timeSinceVFX < requiredDelay then
+        if aeroConfig.debugMode and math.floor(timeSinceVFX * 5) % 1 == 0 then
+            print(string.format("🌪️ [WAITING VFX] %.2fs / %.2fs", timeSinceVFX, requiredDelay))
+        end
+        return false  -- MUST WAIT - don't parry early
+    end
+    
+    -- Check if we're still within tornado duration
+    if not IsWithinTornadoDuration() then
+        if aeroConfig.debugMode then
+            print("🌪️ [TIMEOUT] Tornado duration expired")
+        end
+        tracking.AeroVFXDetected = false
+        return false
+    end
+    
+    -- Speed check (lenient - just ensure ball is moving)
+    if currentSpeed < aeroConfig.minSpeedForParry then
+        if aeroConfig.debugMode then
+            print(string.format("🌪️ [SPEED TOO LOW] Current: %d / Required: %d", math.floor(currentSpeed), aeroConfig.minSpeedForParry))
+        end
+        return false
+    end
+    
+    -- Alignment check
+    local distance = VectorMagnitude(ballPos - playerPos)
+    local toPlayer = (playerPos - ballPos)
+    local toPlayerMag = VectorMagnitude(toPlayer)
+    
+    if toPlayerMag < 0.01 then
+        return false  -- Too close to calculate direction
+    end
+    
+    local toPlayerNorm = toPlayer / toPlayerMag
+    local ballDirNorm = ballVel / currentSpeed
+    local alignment = toPlayerNorm.X * ballDirNorm.X + toPlayerNorm.Y * ballDirNorm.Y + toPlayerNorm.Z * ballDirNorm.Z
+    
+    if alignment >= aeroConfig.alignmentThreshold then
+        print(string.format("🌪️ ✅ AERO VFX PARRY READY | Time: %.2fs | A:%.2f | S:%d | D:%d", 
+            timeSinceVFX, alignment, math.floor(currentSpeed), math.floor(distance)))
+        
+        -- Reset VFX detection
+        tracking.AeroVFXDetected = false
+        tracking.AeroTornadoStartTime = 0
+        
+        return true
+    else
+        if aeroConfig.debugMode and math.random() < 0.2 then
+            print(string.format("🌪️ [ALIGNMENT LOW] Current: %.2f / Required: %.2f", alignment, aeroConfig.alignmentThreshold))
+        end
+    end
+    
+    return false
+end
+
+-- DYNAMIC CLICK SYSTEM
+local function GetClickSettings(distance, approachVelocity)
+    if not Config.DynamicClickRates then
+        return 1, 50
+    end
+    
+    if approachVelocity < 50 then
+        return 1, 50
+    end
+    
+    for _, zone in ipairs(Config.ClickRateZones) do
+        local maxDist = zone[1]
+        local clickCount = zone[2]
+        local minDelay = zone[3]
+        
+        if distance <= maxDist then
+            if approachVelocity < 200 and clickCount > 1 then
+                clickCount = clickCount - 1
+            end
+            return clickCount, minDelay
+        end
+    end
+    
+    return 1, 50
+end
+
+local function GetSpeedAdjustedRapidDistance(speed)
+    if not Config.SpeedBasedRapidParry then
+        return 65
+    end
+    
+    for i = #Config.SpeedRapidParryTiers, 1, -1 do
+        local tier = Config.SpeedRapidParryTiers[i]
+        local speedThreshold = tier[1]
+        local maxDistance = tier[2]
+        
+        if speed >= speedThreshold then
+            return maxDistance
+        end
+    end
+    
+    return 65
+end
+
+local function ExecuteDynamicClicks(distance, approachVelocity)
+    local clickCount, minDelayMs = GetClickSettings(distance, approachVelocity)
+    local currentTime = tick()
+    local timeSinceLastClick = (currentTime - _G.AutoParryState.DynamicClick.lastClickTime) * 1000
+    
+    if timeSinceLastClick < minDelayMs then
+        return false
+    end
+    
+    for i = 1, clickCount do
+        mouse1click()
+        if i < clickCount and clickCount > 1 then
+            task.wait(0.001)
+        end
+    end
+    
+    _G.AutoParryState.DynamicClick.lastClickTime = currentTime
+    _G.AutoParryState.DynamicClick.clickCount = clickCount
+    
+    return true
+end
+
+-- DISTANCE-SPEED CORRELATION
+local function GetDistanceSpeedMultiplier(distance, speed)
+    if not Config.UseDistanceSpeedCorrelation then
+        return 1.0, 0
+    end
+    
+    for _, range in ipairs(Config.DistanceSpeedRanges) do
+        local minDist = range[1]
+        local maxDist = range[2]
+        local baseMultiplier = range[3]
+        local speedScaling = range[4]
+        
+        if distance >= minDist and distance < maxDist then
+            local speedAdjustment = speed * speedScaling
+            return baseMultiplier, speedAdjustment
+        end
+    end
+    
+    return 1.0, 0
+end
+
+local function GetProgressiveDistanceMultiplier(distance)
+    if not Config.ProgressiveDistanceEnabled then
+        return 1.0
+    end
+    
+    for _, range in ipairs(Config.ProgressiveDistanceRanges) do
+        local maxDist = range[1]
+        local multiplier = range[2]
+        
+        if distance <= maxDist then
+            return multiplier
+        end
+    end
+    
+    return 1.0
+end
+
+-- ABILITY DETECTION
+local function GetEquippedAbility()
+    local currentTime = tick()
+    if currentTime - _G.AutoParryState.AbilityTracking.LastAbilityCheck < 0.1 then
+        return _G.AutoParryState.AbilityTracking.CurrentAbility
+    end
+    
+    _G.AutoParryState.AbilityTracking.LastAbilityCheck = currentTime
+    
+    local player = _G.AutoParryState.LocalPlayer
+    if player then
+        local ability = player:GetAttribute("EquippedAbility")
+        if ability then
+            local abilityStr = tostring(ability)
+            
+            if abilityStr ~= _G.AutoParryState.AbilityTracking.CurrentAbility then
+                local oldAbility = _G.AutoParryState.AbilityTracking.CurrentAbility
+                _G.AutoParryState.AbilityTracking.CurrentAbility = abilityStr
+                
+                local abilityLower = abilityStr:lower()
+                if abilityLower:find("infinity") or abilityLower:find("inf") then
+                    _G.AutoParryState.AbilityTracking.AbilityCooldowns.Infinity = 0
+                elseif abilityLower:find("singularity") or abilityLower:find("sing") then
+                    _G.AutoParryState.AbilityTracking.AbilityCooldowns.Singularity = 0
+                elseif abilityLower:find("raging") then
+                    _G.AutoParryState.AbilityTracking.AbilityCooldowns.RagingDeflection = 0
+                elseif abilityLower:find("calming") then
+                    _G.AutoParryState.AbilityTracking.AbilityCooldowns.CalmingDeflection = 0
+                elseif abilityLower:find("aerodynamic") or abilityLower:find("aero") then
+                    _G.AutoParryState.AbilityTracking.AbilityCooldowns.AerodynamicSlash = 0
+                elseif abilityLower:find("rapture") then
+                    _G.AutoParryState.AbilityTracking.AbilityCooldowns.Rapture = 0
+                elseif abilityLower:find("death") then
+                    _G.AutoParryState.AbilityTracking.AbilityCooldowns.DeathSlash = 0
+                elseif abilityLower:find("fury") or abilityLower:find("slash of fury") then
+                    _G.AutoParryState.AbilityTracking.AbilityCooldowns.SlashOfFury = 0
+                end
+                
+                if oldAbility and oldAbility ~= "" then
+                    print(string.format("🔄 Ability changed: %s → %s", oldAbility, abilityStr))
+                end
+            end
+            
+            return abilityStr
+        end
+    end
+    
+    local character = player.Character
+    if character then
+        local ability = character:GetAttribute("EquippedAbility")
+        if ability then
+            return tostring(ability)
+        end
+    end
+    
+    return nil
+end
+
+local function PressQKey()
+    keypress(0x51)
+    keyrelease(0x51)
+end
+
+local function CanUseAbility(abilityName)
+    local currentTime = tick()
+    local cooldownEnd = _G.AutoParryState.AbilityTracking.AbilityCooldowns[abilityName] or 0
+    
+    if currentTime < cooldownEnd then
+        return false, string.format("%.1fs", cooldownEnd - currentTime)
+    end
+    
+    if currentTime - _G.AutoParryState.AbilityTracking.LastAutoPop < 0.2 then
+        return false, "global CD"
+    end
+    
+    return true, "ready"
+end
+
+local function UseAbility(abilityName, cooldownDuration)
+    local canUse, reason = CanUseAbility(abilityName)
+    if not canUse then
+        return false
+    end
+    
+    local currentTime = tick()
+    PressQKey()
+    
+    local actualCooldown = cooldownDuration
+    
+    if abilityName == "Infinity" then
+        actualCooldown = 28
+    elseif abilityName == "Singularity" then
+        actualCooldown = 20
+    elseif abilityName == "RagingDeflection" then
+        actualCooldown = 25
+    elseif abilityName == "CalmingDeflection" then
+        actualCooldown = 25
+    elseif abilityName == "AerodynamicSlash" then
+        actualCooldown = 30
+    elseif abilityName == "Rapture" then
+        actualCooldown = 30
+    elseif abilityName == "DeathSlash" then
+        actualCooldown = 13
+    elseif abilityName == "SlashOfFury" then
+        actualCooldown = 27  -- Correct cooldown: 27s
+    end
+    
+    _G.AutoParryState.AbilityTracking.AbilityCooldowns[abilityName] = currentTime + actualCooldown
+    _G.AutoParryState.AbilityTracking.LastAutoPop = currentTime
+
+    -- Death Slash QTE
+    if abilityName == "DeathSlash" and Config.AutoPopAbilities.DeathSlash.qteEnabled then
+        task.spawn(function()
+            task.wait(Config.AutoPopAbilities.DeathSlash.qteDelay)
+            for i = 1, Config.AutoPopAbilities.DeathSlash.qtePressCount do
+                mouse1click()
+                if i < Config.AutoPopAbilities.DeathSlash.qtePressCount then
+                    task.wait(0.05)
+                end
+            end
+        end)
+    end
+
+    -- SLASH OF FURY - 38 CLICKS
+    if abilityName == "SlashOfFury" then
+        
+        _G.AutoParryState.AbilityTracking.SoFActive = true
+        _G.AutoParryState.AbilityTracking.SoFStartTime = currentTime
+        _G.AutoParryState.AbilityTracking.SoFPreparedForReturn = false
+        
+        task.spawn(function()
+            -- Initial delay before starting clicks (let ability fully activate)
+            task.wait(0.3)
+            
+            -- Pattern: First 23 clicks at 0.10s intervals, remaining 15 at 0.05s
+            for i = 1, 38 do
+                mouse1click()
+                
+                if i < 38 then
+                    local delay = i <= 23 and 0.100 or 0.050
+                    task.wait(delay)
+                end
+            end
+            
+            _G.AutoParryState.AbilityTracking.SoFActive = false
+
+            -- Preparation for high-speed return
+            if Config.AutoPopAbilities.SlashOfFury.prepareForReturn then
+                _G.AutoParryState.AbilityTracking.SoFPreparedForReturn = true
+
+                -- 5 second window for return
+                task.spawn(function()
+                    task.wait(5.0)
+                    if _G.AutoParryState.AbilityTracking.SoFPreparedForReturn then
+                        _G.AutoParryState.AbilityTracking.SoFPreparedForReturn = false
+                    end
+                end)
+            end
+        end)
+    end
+    
+    pcall(function()
+        send_notification("⚡ " .. abilityName)
+    end)
+    
+    return true
+end
+
+-- CACHE UPDATES
+RunService.PreLocal:Connect(function()
+    if not _G.AutoParryState.ThreadRunning then return end
+    
+    pcall(function()
+        if _G.AutoParryState.LocalPlayer then
+            _G.AutoParryState.CachedCharacter = _G.AutoParryState.LocalPlayer.Character
+            if _G.AutoParryState.CachedCharacter then
+                _G.AutoParryState.CachedHRP = _G.AutoParryState.CachedCharacter:FindFirstChild("HumanoidRootPart")
+            end
+        end
+        
+        _G.AutoParryState.CachedBallsFolder = workspace:FindFirstChild("Balls")
+        _G.AutoParryState.CachedAliveFolder = workspace:FindFirstChild("Alive")
+        
+        if _G.AutoParryState.CachedAliveFolder then
+            _G.AutoParryState.CachedPlayerModel = _G.AutoParryState.CachedAliveFolder:FindFirstChild(_G.AutoParryState.LocalPlayer.Name)
+        end
+    end)
+end)
+
+-- TARGET DETECTION
+RunService.PreLocal:Connect(function()
+    if not _G.AutoParryState.ThreadRunning then return end
+    
+    pcall(function()
+        local isTargeted = IsTargeted()
+        _G.AutoParryState.BallData.isTargeted = isTargeted
+        
+        if not isTargeted then
+            _G.AutoParryState.Clicked = false
+        end
+        
+        -- FREEZE CHECK: If targeted but ball is frozen, reset clicked flag
+        if isTargeted and _G.AutoParryState.AbilityTracking.BallFrozen then
+            if _G.AutoParryState.Clicked then
+                _G.AutoParryState.Clicked = false
+                if Config.FreezeDebugMode then
+                    print("❄️ Reset clicked - targeted but frozen")
+                end
+            end
+        end
+    end)
+end)
+
+-- AUTOCLICKER
+local AutoclickerLastClick = 0
+
+RunService.PreLocal:Connect(function()
+    if not _G.AutoParryState.AutoclickerMode then return end
+
+    local currentTime = tick()
+    if currentTime - AutoclickerLastClick < AutoclickerSettings.ClickInterval then return end
+
+    AutoclickerLastClick = currentTime
+
+    mouse1click()
+    mouse1click()
+    mouse1click()
+    mouse1click()
+end)
+
+-- TRIGGER BOT (clicks when ball is targeting player, prevents double clicks)
+RunService.PreLocal:Connect(function()
+    if not TBSettings.Enabled then
+        TBSettings.HasClicked = false
+        return
+    end
+
+    local isTargeting = IsTargeted()
+
+    if isTargeting then
+        -- Only click once per targeting session
+        if not TBSettings.HasClicked then
+            local currentTime = tick()
+            if (currentTime - TBSettings.LastClickTime) >= (TBSettings.ClickDelay / 1000) then
+                mouse1click()
+                TBSettings.LastClickTime = currentTime
+                TBSettings.HasClicked = true
+            end
+        end
+    else
+        -- Reset when no longer targeting (allows next click when targeted again)
+        TBSettings.HasClicked = false
+    end
+end)
+
+-- MARTYRDOM TRACKING THREAD
+RunService.PreLocal:Connect(function()
+    if not _G.AutoParryState.ThreadRunning or not Config.MartyrdomDetectionEnabled then return end
+    
+    pcall(function()
+        local myPos = GetPlayerPosition()
+        if not myPos then return end
+        
+        local tracking = _G.AutoParryState.AbilityTracking
+        
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= _G.AutoParryState.LocalPlayer and player.Character then
+                local playerName = player.Name
+                local health = GetPlayerHealth(player)
+                local distance = GetDistanceToPlayer(player.Character)
+                local hasMartyrdom = HasMartyrdomAbility(player)
+                
+                -- Update low health tracking
+                tracking.LowHealthPlayers[playerName] = {
+                    health = health,
+                    distance = distance,
+                    hasMartyrdom = hasMartyrdom,
+                    time = tick()
+                }
+                
+                -- Death detection
+                local isDead = health <= 0
+                local wasAlive = tracking.LastPlayerStates[playerName]
+                
+                if isDead and wasAlive and hasMartyrdom and distance <= Config.MartyrdomSafeDistance * 2 then
+                    local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        TrackMartyrdomExplosion(playerName, hrp.Position, tick())
+                    end
+                end
+                
+                tracking.LastPlayerStates[playerName] = not isDead
+            end
+        end
+        
+        -- Clean up old data
+        local currentTime = tick()
+        for playerName, data in pairs(tracking.LowHealthPlayers) do
+            if currentTime - data.time > 5 then
+                tracking.LowHealthPlayers[playerName] = nil
+            end
+        end
+    end)
+end)
+
+-- BALL TRACKING
+RunService.PreLocal:Connect(function()
+    if not _G.AutoParryState.ThreadRunning then return end
+    
+    pcall(function()
+        local Ball = GetCurrentBall()
+        local currentTime = tick()
+        
+        if not Ball then
+            if _G.AutoParryState.BallData.ballExists then
+                _G.AutoParryState.BallData.ballExists = false
+            end
+            _G.AutoParryState.BallTracking.lastBallSpeed = 0
+            _G.AutoParryState.BallTracking.lastBallDistance = 999
+            _G.AutoParryState.BallData.lastBallPosition = nil
+            _G.AutoParryState.BallData.approachVelocity = 0
+            _G.AutoParryState.BallTracking.peakSpeed = 0
+            return
+        end
+
+        if not _G.AutoParryState.BallData.ballExists then
+            _G.AutoParryState.BallData.ballExists = true
+            _G.AutoParryState.BallData.ballRespawnTime = currentTime
+            _G.AutoParryState.Clicked = false
+            _G.AutoParryState.LastParryTime = 0
+        end
+        
+        local ballVel = _G.GetBallVelocity(Ball)
+        local currentSpeed = VectorMagnitude(ballVel)
+        local lastSpeed = _G.AutoParryState.BallTracking.lastBallSpeed
+        local speedDifference = currentSpeed - lastSpeed
+        
+        -- CHECK FOR FREEZE ABILITY
+        CheckFreezeAbility()
+        
+        -- CHECK FOR TELEKINESIS ABILITY
+        CheckTelekinesisAbility()
+        
+        -- CHECK FOR AERO SLASH VFX ON BALL
+        CheckAeroSlashVFX()
+        
+        -- DETECT FREEZE & TELEKINESIS
+        DetectBallFreeze(currentSpeed, currentTime)
+        DetectTelekinesis(currentSpeed, currentTime)
+        
+        -- Peak speed tracking
+        local peakSpeed = _G.AutoParryState.BallTracking.peakSpeed
+        local peakSpeedTime = _G.AutoParryState.BallTracking.peakSpeedTime
+        
+        if currentSpeed > peakSpeed then
+            peakSpeed = currentSpeed
+            peakSpeedTime = currentTime
+            _G.AutoParryState.BallTracking.peakSpeed = peakSpeed
+            _G.AutoParryState.BallTracking.peakSpeedTime = peakSpeedTime
+        end
+        
+        if currentTime - peakSpeedTime > _G.AutoParryState.BallTracking.speedSmoothWindow then
+            peakSpeed = currentSpeed
+            peakSpeedTime = currentTime
+            _G.AutoParryState.BallTracking.peakSpeed = peakSpeed
+            _G.AutoParryState.BallTracking.peakSpeedTime = peakSpeedTime
+        end
+        
+        -- Distance and approach velocity
+        local playerPos = GetPlayerPosition()
+        local approachVelocity = 0
+        local distance = 999
+        
+        if playerPos then
+            local ballPos = Ball.Position
+            distance = VectorMagnitude(ballPos - playerPos)
+            _G.AutoParryState.BallTracking.lastBallDistance = distance
+            
+            local lastBallPos = _G.AutoParryState.BallData.lastBallPosition
+            if lastBallPos then
+                local lastDistance = VectorMagnitude(lastBallPos - playerPos)
+                local distanceChange = lastDistance - distance
+                approachVelocity = distanceChange / 0.016
+                approachVelocity = MAX(0, approachVelocity)
+                _G.AutoParryState.BallData.approachVelocity = approachVelocity
+            end
+            
+            _G.AutoParryState.BallData.lastBallPosition = ballPos
+        end
+        
+        _G.AutoParryState.BallTracking.lastBallSpeed = currentSpeed
+        _G.AutoParryState.BallTracking.lastCheckTime = currentTime
+        
+        local isTargeted = IsTargeted()
+        
+        -- SLASH OF FURY INSTANT RETURN PARRY
+        if _G.AutoParryState.AbilityTracking.SoFPreparedForReturn and isTargeted then
+            -- INSTANT parry like triggerbot - don't wait, just click immediately
+            if currentSpeed >= 400 and not _G.AutoParryState.Clicked then
+                mouse1click()
+                _G.AutoParryState.Clicked = true
+                _G.AutoParryState.LastParryTime = currentTime
+                _G.AutoParryState.AbilityTracking.SoFPreparedForReturn = false
+            end
+        end
+
+        -- Velocity spike detection (DISABLED during Aero VFX)
+        if not _G.AutoParryState.AbilityTracking.AeroVFXDetected then
+            local spikeThreshold = 200
+            if peakSpeed >= 600 then
+                spikeThreshold = 150
+            end
+
+            local timeSinceLastParry = currentTime - (_G.AutoParryState.LastParryTime or 0)
+            local allowSpikeDetection = timeSinceLastParry > 0.3
+
+            if allowSpikeDetection and speedDifference >= spikeThreshold and lastSpeed > 30 and distance > 50 and isTargeted and not _G.AutoParryState.Clicked and Config.AutoParryEnabled and not _G.AutoParryState.AutoclickerMode then
+                mouse1click()
+                _G.AutoParryState.Clicked = true
+                _G.AutoParryState.LastParryTime = currentTime
+            end
+        end
+    end)
+end)
+
+-- AUTO-PARRY LOGIC
+RunService.PreLocal:Connect(function()
+    if not _G.AutoParryState.ThreadRunning or not Config.AutoParryEnabled or _G.AutoParryState.AutoclickerMode then
+        return
+    end
+    
+    pcall(function()
+        local currentTime = tick()
+        local isTargeted = _G.AutoParryState.BallData.isTargeted
+        
+        -- Don't interfere with Slash of Fury clicks
+        if _G.AutoParryState.AbilityTracking.SoFActive then
+            return
+        end
+        
+        -- MARTYRDOM SAFETY CHECK - Skip parrying if in danger
+        if ShouldAvoidMartyrdom() then
+            return
+        end
+        
+        -- FREEZE ABILITY CHECK - Allow parrying frozen balls OR auto-parry after freeze expires
+        if ShouldParryFrozenBall() then
+            local Ball = GetCurrentBall()
+            if Ball and not _G.AutoParryState.Clicked then
+                mouse1click()
+                _G.AutoParryState.Clicked = true
+                _G.AutoParryState.LastParryTime = currentTime
+                
+                if Config.FreezeDebugMode then
+                    print("❄️ Freeze parry executed (manual)")
+                end
+                
+                return
+            end
+        end
+        
+        -- FREEZE EXPIRATION CHECK - Resume normal parrying after freeze ends
+        if _G.AutoParryState.AbilityTracking.FreezeJustExpired then
+            local timeSinceExpire = currentTime - _G.AutoParryState.AbilityTracking.FreezeExpireTime
+            
+            -- Clear flag after short time and let normal parry logic handle it
+            if timeSinceExpire > 0.2 then
+                _G.AutoParryState.AbilityTracking.FreezeJustExpired = false
+                
+                if Config.FreezeDebugMode then
+                    print("❄️ Freeze flag cleared - normal parry resumed")
+                end
+            end
+            -- Don't block parrying - let it fall through to normal logic
+        end
+        
+        -- TELEKINESIS ABILITY CHECK - React to redirects
+        if ShouldParryTelekinesis() then
+            local Ball = GetCurrentBall()
+            if Ball and not _G.AutoParryState.Clicked then
+                mouse1click()
+                _G.AutoParryState.Clicked = true
+                _G.AutoParryState.LastParryTime = currentTime
+                
+                _G.AutoParryState.AbilityTracking.TelekinesisActive = false
+                
+                return
+            end
+        end
+        
+        -- AERODYNAMIC SLASH VFX-BASED CHECK (PRIORITY - blocks normal parry)
+        if _G.AutoParryState.AbilityTracking.AeroVFXDetected then
+            local Ball = GetCurrentBall()
+            local playerPos = GetPlayerPosition()
+            
+            if Ball and playerPos and not _G.AutoParryState.Clicked then
+                local ballPos = Ball.Position
+                local ballVel = _G.GetBallVelocity(Ball)
+                local currentSpeed = VectorMagnitude(ballVel)
+                
+                -- Run VFX-based check
+                if CheckAeroSlashParryVFX(ballPos, ballVel, playerPos, currentSpeed, currentTime) then
+                    mouse1click()
+                    _G.AutoParryState.Clicked = true
+                    _G.AutoParryState.LastParryTime = currentTime
+                    
+                    pcall(function()
+                        send_notification("🌪️ Aero Defended!")
+                    end)
+                end
+            end
+            
+            -- CRITICAL: Don't run normal parry logic while Aero is active
+            return
+        end
+        
+        local hasCape = HasSingularityCape()
+        if hasCape then
+            local Ball = GetCurrentBall()
+            if Ball and isTargeted then
+                local ballVel = _G.GetBallVelocity(Ball)
+                local speed = VectorMagnitude(ballVel)
+                local playerPos = GetPlayerPosition()
+                
+                if playerPos then
+                    local ballPos = Ball.Position
+                    local distance = VectorMagnitude(ballPos - playerPos)
+
+                    if not (speed > 300 and distance < 100) then
+                        return
+                    end
+                else
+                    return
+                end
+            else
+                return
+            end
+        end
+        
+        local Ball = GetCurrentBall()
+        local playerPos = GetPlayerPosition()
+        
+        if not Ball or not playerPos or not isTargeted then
+            return
+        end
+        
+        local ballPos = Ball.Position
+        local ballVel = _G.GetBallVelocity(Ball)
+        local currentSpeed = VectorMagnitude(ballVel)
+        local distance = VectorMagnitude(ballPos - playerPos)
+        local approachVelocity = _G.AutoParryState.BallData.approachVelocity or 0
+        
+        if currentSpeed <= Config.MinParrySpeed then return end
+        
+        local speedForMultiplier = _G.AutoParryState.BallTracking.peakSpeed
+        if speedForMultiplier < currentSpeed then
+            speedForMultiplier = currentSpeed
+        end
+        
+        -- Ultra-high speed instant reaction
+        if speedForMultiplier >= 700 and isTargeted and not _G.AutoParryState.Clicked then
+            local shouldInstantParry = false
+            
+            if distance < 40 then
+                shouldInstantParry = true
+            elseif distance < 100 then
+                local movingToward = IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
+                shouldInstantParry = movingToward
+            end
+            
+            if shouldInstantParry then
+                mouse1click()
+                _G.AutoParryState.Clicked = true
+                _G.AutoParryState.LastParryTime = currentTime
+                return
+            end
+        end
+        
+        -- Direction check
+        local movingToward = true
+        if ShouldCheckDirection(distance) then
+            movingToward = IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
+        end
+        
+        if not movingToward then return end
+        
+        -- Calculate timing
+        local adjustedDistance = MAX(0, distance - Config.ParryBufferDistance)
+        local timeToReach = adjustedDistance / currentSpeed
+        
+        local distanceMultiplier, speedAdjustment = GetDistanceSpeedMultiplier(distance, speedForMultiplier)
+        local progressiveDistMultiplier = GetProgressiveDistanceMultiplier(distance)
+        
+        local baseParryTime = timeToReach * distanceMultiplier
+        baseParryTime = baseParryTime * progressiveDistMultiplier
+        
+        if speedAdjustment ~= 0 then
+            baseParryTime = baseParryTime - speedAdjustment
+        end
+        
+        baseParryTime = baseParryTime / Config.ParryAggressiveness
+        
+        local adjustedTimeToReach = baseParryTime
+        
+        -- Speed-based rapid parry
+        local speedAdjustedRapidDistance = GetSpeedAdjustedRapidDistance(speedForMultiplier)
+        local shouldUseRapidParry = distance <= speedAdjustedRapidDistance
+        
+        if shouldUseRapidParry and speedForMultiplier >= 500 then
+            local clickCount, minDelay = GetClickSettings(distance, approachVelocity)
+            local rapidThreshold = _G.AutoParryState.CompensatedParryTime * 1.3
+            
+            if adjustedTimeToReach <= rapidThreshold and not _G.AutoParryState.Clicked then
+                -- Don't rapid parry if ball is frozen
+                if _G.AutoParryState.AbilityTracking.BallFrozen then
+                    if Config.FreezeDebugMode then
+                        print("❄️ Skipped rapid parry - ball is frozen")
+                    end
+                    return
+                end
+                
+                local success = ExecuteDynamicClicks(distance, approachVelocity)
+
+                if success then
+                    _G.AutoParryState.Clicked = true
+                    _G.AutoParryState.LastParryTime = tick()
+                    return
+                end
+            end
+        end
+        
+        -- FROZEN BALL PARRY - Allow immediate parry if frozen and targeted
+        if canParryFrozen and not _G.AutoParryState.Clicked then
+            mouse1click()
+            _G.AutoParryState.Clicked = true
+            _G.AutoParryState.LastParryTime = currentTime
+            
+            if Config.TelekinesisDebugMode then
+                print("🧊 Parried frozen ball")
+            end
+            return
+        end
+        
+        -- Check if time to act
+        if adjustedTimeToReach <= _G.AutoParryState.CompensatedParryTime and not _G.AutoParryState.Clicked then
+            
+            -- FREEZE CHECK: Don't parry if ball is freezing (speed dropping to near 0)
+            if _G.AutoParryState.AbilityTracking.BallFrozen then
+                if Config.FreezeDebugMode then
+                    print("❄️ Skipped parry - ball is frozen")
+                end
+                return  -- Ball is frozen, wait for unfreeze
+            end
+            
+            -- ADDITIONAL SAFETY CHECKS TO PREVENT EARLY PARRY (relaxed)
+            -- 1. Ball must have minimum speed (very low threshold)
+            if currentSpeed < 20 then
+                return  -- Ball too slow, probably just spawned
+            end
+            
+            -- 2. Ball must be reasonably close (generous limit)
+            if distance > 300 then
+                return  -- Way too far away
+            end
+            
+            local equippedAbility = GetEquippedAbility()
+            local abilityUsed = false
+            
+            if equippedAbility then
+                local abilityLower = equippedAbility:lower()
+                
+                -- INFINITY
+                if (abilityLower:find("infinity") or abilityLower:find("inf")) and Config.AutoPopAbilities.Infinity.enabled then
+                    if UseAbility("Infinity", 28) then
+                        _G.AutoParryState.Clicked = true
+                        abilityUsed = true
+                    end
+                end
+
+                -- RAGING DEFLECTION
+                if not abilityUsed and abilityLower:find("raging") and Config.AutoPopAbilities.RagingDeflection.enabled then
+                    if UseAbility("RagingDeflection", 35) then
+                        _G.AutoParryState.Clicked = true
+                        abilityUsed = true
+                    end
+                end
+
+                -- CALMING DEFLECTION
+                if not abilityUsed and abilityLower:find("calming") and Config.AutoPopAbilities.CalmingDeflection.enabled then
+                    if UseAbility("CalmingDeflection", 35) then
+                        _G.AutoParryState.Clicked = true
+                        abilityUsed = true
+                    end
+                end
+
+                -- SINGULARITY
+                if not abilityUsed and (abilityLower:find("singularity") or abilityLower:find("sing")) and Config.AutoPopAbilities.Singularity.enabled then
+                    if Config.AutoPopAbilities.Singularity.useOnParry then
+                        if UseAbility("Singularity", 24) then
+                            _G.AutoParryState.Clicked = true
+                            abilityUsed = true
+                        end
+                    end
+                end
+
+                -- DEATH SLASH
+                if not abilityUsed and abilityLower:find("death") and Config.AutoPopAbilities.DeathSlash.enabled then
+                    if Config.AutoPopAbilities.DeathSlash.useOnParry then
+                        if UseAbility("DeathSlash", 13) then
+                            _G.AutoParryState.Clicked = true
+                            abilityUsed = true
+                        end
+                    end
+                end
+
+                -- AERODYNAMIC SLASH
+                if not abilityUsed and (abilityLower:find("aerodynamic") or abilityLower:find("aero")) and Config.AutoPopAbilities.AerodynamicSlash.enabled then
+                    if Config.AutoPopAbilities.AerodynamicSlash.useOnParry then
+                        if UseAbility("AerodynamicSlash", 40) then
+                            _G.AutoParryState.Clicked = true
+                            abilityUsed = true
+                        end
+                    end
+                end
+
+                -- RAPTURE
+                if not abilityUsed and abilityLower:find("rapture") and Config.AutoPopAbilities.Rapture.enabled then
+                    if Config.AutoPopAbilities.Rapture.useOnParry then
+                        if UseAbility("Rapture", 30) then
+                            _G.AutoParryState.Clicked = true
+                            abilityUsed = true
+                        end
+                    end
+                end
+
+                -- SLASH OF FURY
+                if not abilityUsed and (abilityLower:find("fury") or abilityLower:find("slash of fury")) and Config.AutoPopAbilities.SlashOfFury.enabled then
+                    if Config.AutoPopAbilities.SlashOfFury.useOnParry then
+                        if distance >= Config.AutoPopAbilities.SlashOfFury.activateMinDistance and
+                           distance <= Config.AutoPopAbilities.SlashOfFury.activateMaxDistance and
+                           currentSpeed >= Config.AutoPopAbilities.SlashOfFury.activateMinSpeed then
+                            if UseAbility("SlashOfFury", 27) then
+                                _G.AutoParryState.Clicked = true
+                                abilityUsed = true
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- Normal parry if no ability used
+            if not abilityUsed then
+                local clicksExecuted = ExecuteDynamicClicks(distance, approachVelocity)
+                if clicksExecuted then
+                    _G.AutoParryState.Clicked = true
+                    _G.AutoParryState.LastParryTime = tick()
+                end
+            end
+        end
+    end)
+end)
+
+-- UI (UiLib-based settings menu)
+local UiLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/xposn/ui/refs/heads/main/UiLib.lua"))()
+
+-- Get screen size for centering
+local camera = game:GetService("Workspace").CurrentCamera
+local screenSize = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+local menuWidth = 400
+local menuHeight = 400
+local centerX = (screenSize.X - menuWidth) / 2
+local centerY = (screenSize.Y - menuHeight) / 2
+
+-- Create Window
+local Window = UiLib:CreateWindow({
+    Title = "Who's AP?                                                                            w6lv (UI By X)",
+    Subtitle = "F3 to toggle",
+    Position = Vector2.new(centerX, centerY),
+    Width = menuWidth,
+    ToggleKey = "F3"
+})
+
+Window:SetTheme({
+    Accent = Color3.fromRGB(130, 90, 255),
+    On = Color3.fromRGB(0, 255, 180),
+    Off = Color3.fromRGB(255, 60, 85)
+})
+
+-- Main Tab
+local MainTab = Window:CreateTab("Main")
+
+local AutoParryToggle = MainTab:CreateToggle({
+    Name = "Auto Parry",
+    Default = Config.AutoParryEnabled,
+    Tooltip = "Automatically parry incoming balls",
+    Callback = function(value)
+        Config.AutoParryEnabled = value
+    end
+})
+
+local AutoParryKeybind = MainTab:CreateKeybind({
+    Name = "AP Keybind",
+    Default = Keybinds.ToggleAutoParry,
+    Mode = "toggle",
+    LinkedToggle = AutoParryToggle,
+    Tooltip = "Toggle auto parry on/off",
+    Callback = function(key)
+        Keybinds.ToggleAutoParry = key
+    end,
+    ActivateCallback = function(active)
+        Config.AutoParryEnabled = active
+    end
+})
+
+MainTab:CreateDivider()
+
+local TBToggle = MainTab:CreateToggle({
+    Name = "Trigger Bot",
+    Default = TBSettings.Enabled,
+    Tooltip = "Auto-click when holding TB key",
+    Callback = function(value)
+        TBSettings.Enabled = value
+    end
+})
+
+local TBKeybind = MainTab:CreateKeybind({
+    Name = "TB Keybind",
+    Default = TBSettings.Keybind,
+    Mode = "toggle",
+    LinkedToggle = TBToggle,
+    Tooltip = "Toggle trigger bot on/off",
+    Callback = function(key)
+        TBSettings.Keybind = key
+    end,
+    ActivateCallback = function(active)
+        TBSettings.Enabled = active
+    end
+})
+
+local TBDelaySlider = MainTab:CreateSlider({
+    Name = "Click Delay",
+    Min = 10,
+    Max = 200,
+    Default = TBSettings.ClickDelay,
+    Step = 5,
+    Suffix = "ms",
+    Tooltip = "Delay between trigger bot clicks",
+    Callback = function(value)
+        TBSettings.ClickDelay = value
+    end
+})
+
+MainTab:CreateDivider()
+
+local AutoclickerToggle = MainTab:CreateToggle({
+    Name = "Autoclicker",
+    Default = _G.AutoParryState.AutoclickerMode,
+    Tooltip = "Rapid click mode",
+    Callback = function(value)
+        _G.AutoParryState.AutoclickerMode = value
+    end
+})
+
+local AutoclickerKeybind = MainTab:CreateKeybind({
+    Name = "AC Keybind",
+    Default = Keybinds.ToggleAutoclicker,
+    Mode = "toggle",
+    LinkedToggle = AutoclickerToggle,
+    Tooltip = "Toggle autoclicker on/off",
+    Callback = function(key)
+        Keybinds.ToggleAutoclicker = key
+    end,
+    ActivateCallback = function(active)
+        _G.AutoParryState.AutoclickerMode = active
+    end
+})
+
+-- Abilities Tab
+local AbilitiesTab = Window:CreateTab("Abilities")
+
+AbilitiesTab:CreateLabel({ Text = "ESP" })
+
+AbilitiesTab:CreateToggle({
+    Name = "Ability ESP",
+    Default = ESPSettings.Enabled,
+    Tooltip = "Show enemy abilities above heads",
+    Callback = function(value)
+        ESPSettings.Enabled = value
+    end
+})
+
+AbilitiesTab:CreateColorpicker({
+    Name = "ESP Color",
+    Default = ESPSettings.AbilityColor,
+    Tooltip = "Color of ability ESP text",
+    Callback = function(color)
+        ESPSettings.AbilityColor = color
+    end
+})
+
+AbilitiesTab:CreateSlider({
+    Name = "ESP Text Size",
+    Min = 10,
+    Max = 24,
+    Default = ESPSettings.TextSize,
+    Step = 1,
+    Tooltip = "Size of ESP text",
+    Callback = function(value)
+        ESPSettings.TextSize = value
+    end
+})
+
+AbilitiesTab:CreateDivider()
+AbilitiesTab:CreateLabel({ Text = "Auto Abilities" })
+
+AbilitiesTab:CreateToggle({
+    Name = "Infinity",
+    Default = Config.AutoPopAbilities.Infinity.enabled,
+    Tooltip = "Auto-use Infinity ability",
+    Callback = function(value)
+        Config.AutoPopAbilities.Infinity.enabled = value
+    end
+})
+
+AbilitiesTab:CreateToggle({
+    Name = "Raging Deflection",
+    Default = Config.AutoPopAbilities.RagingDeflection.enabled,
+    Tooltip = "Auto-use Raging Deflection",
+    Callback = function(value)
+        Config.AutoPopAbilities.RagingDeflection.enabled = value
+    end
+})
+
+AbilitiesTab:CreateToggle({
+    Name = "Calming Deflection",
+    Default = Config.AutoPopAbilities.CalmingDeflection.enabled,
+    Tooltip = "Auto-use Calming Deflection",
+    Callback = function(value)
+        Config.AutoPopAbilities.CalmingDeflection.enabled = value
+    end
+})
+
+AbilitiesTab:CreateToggle({
+    Name = "Singularity",
+    Default = Config.AutoPopAbilities.Singularity.enabled,
+    Tooltip = "Auto-use Singularity",
+    Callback = function(value)
+        Config.AutoPopAbilities.Singularity.enabled = value
+    end
+})
+
+AbilitiesTab:CreateToggle({
+    Name = "Aerodynamic Slash",
+    Default = Config.AutoPopAbilities.AerodynamicSlash.enabled,
+    Tooltip = "Auto-use Aero Slash",
+    Callback = function(value)
+        Config.AutoPopAbilities.AerodynamicSlash.enabled = value
+    end
+})
+
+AbilitiesTab:CreateToggle({
+    Name = "Rapture",
+    Default = Config.AutoPopAbilities.Rapture.enabled,
+    Tooltip = "Auto-use Rapture",
+    Callback = function(value)
+        Config.AutoPopAbilities.Rapture.enabled = value
+    end
+})
+
+AbilitiesTab:CreateToggle({
+    Name = "Death Slash",
+    Default = Config.AutoPopAbilities.DeathSlash.enabled,
+    Tooltip = "Auto-use Death Slash",
+    Callback = function(value)
+        Config.AutoPopAbilities.DeathSlash.enabled = value
+    end
+})
+
+AbilitiesTab:CreateToggle({
+    Name = "Slash of Fury",
+    Default = Config.AutoPopAbilities.SlashOfFury.enabled,
+    Tooltip = "Auto-use Slash of Fury (38 clicks)",
+    Callback = function(value)
+        Config.AutoPopAbilities.SlashOfFury.enabled = value
+    end
+})
+
+-- Settings Tab
+local SettingsTab = Window:CreateTab("Settings")
+
+SettingsTab:CreateLabel({ Text = "Timing" })
+
+SettingsTab:CreateSlider({
+    Name = "Base Parry Time",
+    Min = 0.1,
+    Max = 1.0,
+    Default = Config.BaseParryTime,
+    Step = 0.01,
+    Suffix = "s",
+    Tooltip = "Base time before parry",
+    Callback = function(value)
+        Config.BaseParryTime = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Ping Compensation",
+    Min = 0,
+    Max = 1.0,
+    Default = Config.PingCompensation,
+    Step = 0.05,
+    Tooltip = "Multiplier for ping adjustment",
+    Callback = function(value)
+        Config.PingCompensation = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Parry Aggressiveness",
+    Min = 0.5,
+    Max = 2.0,
+    Default = Config.ParryAggressiveness,
+    Step = 0.1,
+    Tooltip = "How aggressive the parry timing is",
+    Callback = function(value)
+        Config.ParryAggressiveness = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Close Range Distance",
+    Min = 10,
+    Max = 100,
+    Default = Config.CloseRangeDistance,
+    Step = 5,
+    Suffix = " stud",
+    Tooltip = "Distance considered close range",
+    Callback = function(value)
+        Config.CloseRangeDistance = value
+    end
+})
+
+SettingsTab:CreateDivider()
+
+SettingsTab:CreateToggle({
+    Name = "Show Keybind List",
+    Default = false,
+    Tooltip = "Show floating keybind panel",
+    Callback = function(value)
+        if value then
+            Window:ShowKeybindList()
+        else
+            Window:HideKeybindList()
+        end
+    end
+})
+
+SettingsTab:CreateDivider()
+SettingsTab:CreateLabel({ Text = "Profiles" })
+
+local function GetProfileOptions()
+    local profiles = Window:GetProfiles()
+    local options = {"Default"}
+    for _, profile in ipairs(profiles) do
+        table.insert(options, profile)
+    end
+    return options
+end
+
+local ProfilesDropdown = SettingsTab:CreateDropdown({
+    Name = "Profile",
+    Options = GetProfileOptions(),
+    Default = "Default",
+    Callback = function(value)
+        -- Profile selected
+    end
+})
+
+local ProfileNameInput = SettingsTab:CreateTextInput({
+    Name = "Profile Name",
+    Default = "MyProfile",
+    Placeholder = "Enter name...",
+    Callback = function(text)
+        -- Name entered
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "Save Profile",
+    Callback = function()
+        local name = ProfileNameInput.Value
+        if name and name ~= "" then
+            if Window:SaveProfile(name) then
+                Window:Notify("Saved: " .. name, 2)
+                ProfilesDropdown.Options = GetProfileOptions()
+            else
+                Window:Notify("Save failed", 2)
+            end
+        else
+            Window:Notify("Enter name first", 2)
+        end
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "Load Profile",
+    Callback = function()
+        local name = ProfilesDropdown.Value
+        if name == "Clear" then
+            Window:ResetToDefaults()
+            Window:Notify("Turn Everything Off", 2)
+        elseif name then
+            if Window:LoadProfile(name) then
+                Window:Notify("Loaded: " .. name, 2)
+            else
+                Window:Notify("Load failed", 2)
+            end
+        end
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "Delete Profile",
+    Callback = function()
+        local name = ProfilesDropdown.Value
+        if name and name ~= "Default" then
+            if Window:DeleteProfile(name) then
+                Window:Notify("Deleted: " .. name, 2)
+                ProfilesDropdown.Options = GetProfileOptions()
+                ProfilesDropdown:Set("Default")
+            else
+                Window:Notify("Delete failed", 2)
+            end
+        end
+    end
+})
+
+-- ESP
+RunService.Render:Connect(function()
+    if not ESPSettings.Enabled then return end
+    
+    pcall(function()
+        local camera = workspace.CurrentCamera
+        if not camera then return end
+        
+        local localName = _G.AutoParryState.LocalPlayer.Name
+        local aliveFolder = workspace:FindFirstChild("Alive")
+        if not aliveFolder then return end
+        
+        local characters = aliveFolder:GetChildren()
+        local alivePlayerNames = {}
+        
+        for _, character in characters do
+            alivePlayerNames[character.Name] = true
+        end
+        
+        for cachedName, _ in pairs(_ESPAbilityCache) do
+            if not alivePlayerNames[cachedName] then
+                _ESPAbilityCache[cachedName] = nil
+            end
+        end
+        
+        for _, character in characters do
+            local playerName = character.Name
+            
+            if playerName ~= localName then
+                local head = character:FindFirstChild("Head")
+                if head then
+                    local headPos = head.Position + Vector3.new(0, 2, 0)
+                    local screenPos, onScreen = camera:WorldToScreenPoint(headPos)
+                    
+                    if onScreen then
+                        local abilityText = nil
+                        
+                        local player = Players:FindFirstChild(playerName)
+                        if player then
+                            local equippedAbility = player:GetAttribute("EquippedAbility")
+                            if equippedAbility and tostring(equippedAbility) ~= "" then
+                                abilityText = tostring(equippedAbility)
+                            end
+                        end
+                        
+                        if not abilityText then
+                            local charAbility = character:GetAttribute("EquippedAbility")
+                            if charAbility and tostring(charAbility) ~= "" then
+                                abilityText = tostring(charAbility)
+                            end
+                        end
+                        
+                        if not abilityText then
+                            local hrp = character:FindFirstChild("HumanoidRootPart")
+                            if hrp then
+                                local hrpAbility = hrp:GetAttribute("EquippedAbility")
+                                if hrpAbility and tostring(hrpAbility) ~= "" then
+                                    abilityText = tostring(hrpAbility)
+                                end
+                            end
+                        end
+                        
+                        if abilityText and abilityText ~= "" then
+                            _ESPAbilityCache[playerName] = abilityText
+                        end
+                        
+                        if (not abilityText or abilityText == "") and _ESPAbilityCache[playerName] then
+                            abilityText = _ESPAbilityCache[playerName]
+                        end
+                        
+                        if abilityText and abilityText ~= "" then
+                            DrawingImmediate.OutlinedText(
+                                vector.create(screenPos.X, screenPos.Y - 20),
+                                ESPSettings.TextSize,
+                                ESPSettings.AbilityColor,
+                                ESPSettings.Opacity,
+                                abilityText,
+                                true,
+                                nil
+                            )
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end)
+
+Window:Notify("Who's AP?", 3)
