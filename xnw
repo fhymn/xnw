@@ -32,7 +32,7 @@ local Config = {
     CloseRangeDistance = 35,
     
     BaseParryTime = 0.47,
-    ParryBufferDistance = 5,
+    ParryBufferDistance = 8,
     PingCompensation = 0.5,
     MinParrySpeed = 3,
     ParryAggressiveness = 1.0,
@@ -115,7 +115,6 @@ local Config = {
         maxDelay = 0.75,                    -- Maximum delay (reduced from 1.2)
         minSpeedForParry = 150,             -- Minimum speed when parrying
         alignmentThreshold = 0.75,          -- Alignment requirement
-        debugMode = false,                  -- Minimal debug logging (not spammy)
     },
     
     -- MARTYRDOM DETECTION SETTINGS
@@ -124,19 +123,16 @@ local Config = {
     MartyrdomExplosionDelay = 0.3,          -- Time after death before explosion
     MartyrdomPreventDistance = 60,          -- Don't approach if player has Martyrdom
     MartyrdomHealthThreshold = 30,          -- Consider dangerous if below this HP
-    MartyrdomDebugMode = false,             -- Minimal debug logging
-    
+
     -- FREEZE & TELEKINESIS DETECTION
     FreezeDetectionEnabled = true,
     FreezeBallSpeedThreshold = 10,          -- Ball speed below this = frozen
     FreezeMinDuration = 0.1,                -- Minimum time frozen to be considered a freeze
     FreezeParryEnabled = true,              -- Allow parrying frozen balls
-    FreezeDebugMode = false,                -- Minimal debug logging
-    
+
     TelekinesisDetectionEnabled = true,
     TelekinesisVelocityThreshold = 400,     -- High velocity spike after telekinesis
     TelekinesisParryDelay = 0.12,           -- React quickly after redirect
-    TelekinesisDebugMode = false,
 }
 
 local TBSettings = {
@@ -335,7 +331,92 @@ end
 
 local function IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
     local toPlayer = playerPos - ballPos
-    return (toPlayer.X * ballVel.X + toPlayer.Y * ballVel.Y + toPlayer.Z * ballVel.Z) > 0
+    local toPlayerMag = VectorMagnitude(toPlayer)
+
+    if toPlayerMag < 0.01 then
+        return true  -- Ball is basically on top of player
+    end
+
+    local toPlayerNorm = toPlayer / toPlayerMag
+    local ballSpeed = VectorMagnitude(ballVel)
+
+    if ballSpeed < 1 then
+        return true  -- Ball too slow to determine direction
+    end
+
+    local ballDirNorm = ballVel / ballSpeed
+
+    -- Dot product: 1 = directly toward, 0 = perpendicular, -1 = away
+    local dotProduct = toPlayerNorm.X * ballDirNorm.X + toPlayerNorm.Y * ballDirNorm.Y + toPlayerNorm.Z * ballDirNorm.Z
+
+    -- IMPROVED: Distance-based threshold for curves (very lenient)
+    local distance = toPlayerMag
+    local threshold
+
+    if distance < 25 then
+        threshold = -0.5  -- Extremely lenient at very close range
+    elseif distance < 50 then
+        threshold = -0.2  -- Very lenient at close-medium range
+    elseif distance < 75 then
+        threshold = 0.1   -- Lenient at medium range
+    else
+        threshold = 0.2   -- Slightly lenient at long range
+    end
+
+    return dotProduct > threshold
+end
+
+-- DYNAMIC PARRY TIMING: Calculate multiplier based on curve angle and speed
+local function GetDynamicCurveMultiplier(ballPos, ballVel, playerPos, currentSpeed)
+    local toPlayer = playerPos - ballPos
+    local toPlayerMag = VectorMagnitude(toPlayer)
+
+    if toPlayerMag < 0.01 or currentSpeed < 1 then
+        return 1.0  -- No adjustment for very close or slow balls
+    end
+
+    local toPlayerNorm = toPlayer / toPlayerMag
+    local ballDirNorm = ballVel / VectorMagnitude(ballVel)
+
+    -- Calculate dot product (alignment)
+    local dotProduct = toPlayerNorm.X * ballDirNorm.X + toPlayerNorm.Y * ballDirNorm.Y + toPlayerNorm.Z * ballDirNorm.Z
+
+    -- CURVE MULTIPLIER: More curved = wait LONGER (bigger parry window) - SUBTLE
+    -- dotProduct: 1.0 (direct) -> 0.0 (perpendicular) -> -1.0 (away)
+    local curveMultiplier
+    if dotProduct > 0.8 then
+        -- Nearly direct shot: standard timing
+        curveMultiplier = 1.0
+    elseif dotProduct > 0.5 then
+        -- Slight curve: wait slightly longer (1.03x)
+        curveMultiplier = 1.03
+    elseif dotProduct > 0.2 then
+        -- Medium curve: wait longer (1.06x)
+        curveMultiplier = 1.06
+    elseif dotProduct > -0.2 then
+        -- Heavy curve: wait much longer (1.09x)
+        curveMultiplier = 1.09
+    else
+        -- Extreme curve: wait even longer (1.12x)
+        curveMultiplier = 1.12
+    end
+
+    -- SPEED MULTIPLIER: Faster = parry earlier (smaller window) - STRONGER
+    local speedMultiplier
+    if currentSpeed < 100 then
+        speedMultiplier = 1.08  -- Slow: more time
+    elseif currentSpeed < 300 then
+        speedMultiplier = 1.0   -- Normal: standard
+    elseif currentSpeed < 500 then
+        speedMultiplier = 0.92  -- Fast: earlier
+    elseif currentSpeed < 700 then
+        speedMultiplier = 0.85  -- Very fast: much earlier
+    else
+        speedMultiplier = 0.78  -- Extreme speed: very early
+    end
+
+    -- Combine both multipliers
+    return curveMultiplier * speedMultiplier
 end
 
 local function ShouldCheckDirection(distance)
@@ -411,12 +492,6 @@ local function FindAeroUserAndCalculateDelay()
                             if aeroConfig.useDynamicDelay then
                                 local calculatedDelay = aeroConfig.baseParryDelay + (distance * aeroConfig.delayPerDistance)
                                 calculatedDelay = MAX(aeroConfig.minDelay, MIN(aeroConfig.maxDelay, calculatedDelay))
-                                
-                                if aeroConfig.debugMode then
-                                    print(string.format("🌪️ Aero: %s | D:%d | Delay:%.2fs", 
-                                        character.Name, math.floor(distance), calculatedDelay))
-                                end
-                                
                                 return enemyPos, calculatedDelay
                             else
                                 return enemyPos, aeroConfig.baseParryDelay
@@ -491,11 +566,6 @@ local function TrackMartyrdomExplosion(playerName, deathPosition, deathTime)
     local tracking = _G.AutoParryState.AbilityTracking
     tracking.ActiveMartyrdoms[playerName] = explosionData
     tracking.DangerZones[playerName] = explosionData
-    
-    if Config.MartyrdomDebugMode then
-        print(string.format("💀 Martyrdom: %s died at distance %.1f", playerName, 
-            VectorMagnitude(deathPosition - GetPlayerPosition())))
-    end
 end
 
 local function IsInMartyrdomDangerZone()
@@ -583,17 +653,6 @@ end
 
 local function ShouldAvoidMartyrdom()
     local inDanger, dangerData = CheckMartyrdomDanger()
-    
-    if inDanger and dangerData and Config.MartyrdomDebugMode then
-        if dangerData.type == "zone" then
-            print(string.format("💀 Danger Zone: %s (%.1fm)", dangerData.name, dangerData.distance))
-        elseif dangerData.type == "low_health" then
-            print(string.format("💀 Low HP: %s (%.0fHP, %.1fm)", dangerData.name, dangerData.health, dangerData.distance))
-        elseif dangerData.type == "explosion" then
-            print(string.format("💀 Explosion: %s (%.1fm)", dangerData.name, dangerData.distance))
-        end
-    end
-    
     return inDanger
 end
 
@@ -601,77 +660,52 @@ end
 
 local function DetectBallFreeze(currentSpeed, currentTime)
     if not Config.FreezeDetectionEnabled then return end
-    
+
     local tracking = _G.AutoParryState.AbilityTracking
-    
+
     -- Detect ball becoming frozen (speed drops to exactly 0 or near 0)
     if currentSpeed <= 2 and tracking.LastBallSpeed > 10 then
         tracking.BallFrozen = true
         tracking.FreezeStartTime = currentTime
-        
-        -- CRITICAL: Reset clicked flag so we can parry after unfreeze
         _G.AutoParryState.Clicked = false
-        
-        if Config.FreezeDebugMode then
-            print(string.format("❄️ Ball frozen (speed: %.1f) - RESET clicked flag", currentSpeed))
-        end
     end
-    
+
     -- EARLY FREEZE DETECTION: If speed is dropping rapidly (freeze starting)
     if not tracking.BallFrozen and currentSpeed < 10 and tracking.LastBallSpeed > 50 then
-        -- Speed dropped dramatically - likely freezing
         _G.AutoParryState.Clicked = false
-        
-        if Config.FreezeDebugMode then
-            print(string.format("❄️ Rapid speed drop detected (%.0f→%.0f) - RESET clicked", tracking.LastBallSpeed, currentSpeed))
-        end
     end
-    
+
     -- Detect ball unfreezing (speed resumes from frozen state)
     if tracking.BallFrozen and currentSpeed > 50 then
-        local freezeDuration = currentTime - tracking.FreezeStartTime
-        
-        -- Set flag to resume normal parrying after unfreeze
         tracking.BallFrozen = false
         tracking.FreezeJustExpired = true
         tracking.FreezeExpireTime = currentTime
-        
-        -- Ensure clicked flag is reset for unfreeze parry
         _G.AutoParryState.Clicked = false
-        
-        if Config.FreezeDebugMode then
-            print(string.format("❄️ Freeze ended after %.2fs (speed now: %.0f) - RESET clicked, ready to parry", freezeDuration, currentSpeed))
-        end
     end
-    
+
     tracking.LastBallSpeed = currentSpeed
 end
 
 local function DetectTelekinesis(currentSpeed, currentTime)
     if not Config.TelekinesisDetectionEnabled then return end
-    
+
     local tracking = _G.AutoParryState.AbilityTracking
-    
+
     -- Detect telekinesis: Ball was frozen, now has high speed spike
     if tracking.BallFrozen and currentSpeed >= Config.TelekinesisSpeedThreshold then
-        -- Check if target changed
         local currentTarget = IsTargeted()
         local targetChanged = currentTarget and currentTarget ~= tracking.TelekinesisLastTarget
-        
+
         if targetChanged or (currentTime - tracking.LastTargetCheck) > 0.5 then
             tracking.TelekinesisActive = true
             tracking.TelekinesisRetargetTime = currentTime
             tracking.TelekinesisLastTarget = currentTarget
             tracking.BallFrozen = false
-            
-            if Config.TelekinesisDebugMode then
-                print(string.format("🔮 Telekinesis detected | Speed: %d | Retargeted", math.floor(currentSpeed)))
-            end
         end
-        
+
         tracking.LastTargetCheck = currentTime
     end
-    
+
     -- Clear telekinesis flag after delay
     if tracking.TelekinesisActive and (currentTime - tracking.TelekinesisRetargetTime) > 1.0 then
         tracking.TelekinesisActive = false
@@ -699,11 +733,8 @@ local function ShouldDelayForTelekinesis(currentTime)
     -- Delay parrying briefly after telekinesis retarget
     if tracking.TelekinesisActive then
         local timeSinceRetarget = currentTime - tracking.TelekinesisRetargetTime
-        
+
         if timeSinceRetarget < Config.TelekinesisRetargetDelay then
-            if Config.TelekinesisDebugMode then
-                print(string.format("🔮 Waiting for telekinesis: %.2fs / %.2fs", timeSinceRetarget, Config.TelekinesisRetargetDelay))
-            end
             return true
         end
     end
@@ -726,27 +757,13 @@ local function CheckFreezeAbility()
     -- Check if ball is frozen (very low speed)
     if currentSpeed < Config.FreezeBallSpeedThreshold then
         if not tracking.BallFrozen then
-            -- Ball just became frozen
             tracking.BallFrozen = true
             tracking.FreezeStartTime = currentTime
             tracking.FreezeDetectedTime = currentTime
-            
-            if Config.FreezeDebugMode then
-                print(string.format("❄️ Freeze detected | Speed: %.1f", currentSpeed))
-            end
         end
         return true
     else
-        -- Ball is no longer frozen
         if tracking.BallFrozen then
-            local freezeDuration = currentTime - tracking.FreezeStartTime
-            
-            if freezeDuration >= Config.FreezeMinDuration then
-                if Config.FreezeDebugMode then
-                    print(string.format("❄️ Freeze ended | Duration: %.2fs", freezeDuration))
-                end
-            end
-            
             tracking.BallFrozen = false
         end
         return false
@@ -787,12 +804,6 @@ local function CheckTelekinesisAbility()
             tracking.TelekinesisActive = true
             tracking.TelekinesisDetectedTime = currentTime
             tracking.TelekinesisTargetChanged = (currentTarget ~= tracking.PreTelekinesisTarget)
-            
-            if Config.TelekinesisDebugMode then
-                print(string.format("🧠 Telekinesis detected | Speed: %.0f | Target: %s", 
-                    currentSpeed, currentTarget or "Unknown"))
-            end
-            
             return true
         end
     end
@@ -848,11 +859,8 @@ local function ShouldParryTelekinesis()
     -- 3. Small delay has passed
     if tracking.TelekinesisActive and IsTargeted() then
         local timeSinceTelekinesis = currentTime - tracking.TelekinesisDetectedTime
-        
+
         if timeSinceTelekinesis >= Config.TelekinesisParryDelay then
-            if Config.TelekinesisDebugMode then
-                print("🧠 Telekinesis parry triggered")
-            end
             return true
         end
     end
@@ -891,11 +899,6 @@ local function CheckAeroSlashVFX()
             tracking.AeroVFXDetectionTime = currentTime
             tracking.AeroUserPosition = aeroUserPos
             tracking.AeroCalculatedDelay = calculatedDelay
-            
-            if Config.AeroDefense.debugMode then
-                print(string.format("🌪️ Aero detected | Delay: %.2fs", calculatedDelay))
-            end
-            
             return true
         end
     end
@@ -913,9 +916,6 @@ local function IsWithinTornadoDuration()
     
     -- Use generous window - tornado duration check was too strict
     if timeSinceTornado < 2.5 then
-        if Config.AeroDefense.debugMode and math.random() < 0.02 then
-            print(string.format("🌪️ [AERO WINDOW] %.2fs / 2.5s", timeSinceTornado))
-        end
         return true
     end
     
@@ -944,68 +944,47 @@ local function CheckAeroSlashParryVFX(ballPos, ballVel, playerPos, currentSpeed,
     
     -- Check if we're targeted now
     if not IsTargeted() then
-        if aeroConfig.debugMode and math.random() < 0.1 then
-            print("🌪️ [NOT TARGETED] Aero detected but not targeted yet")
-        end
         return false
     end
-    
+
     -- CRITICAL: WAIT for full delay after VFX detection (uses dynamic delay)
     local timeSinceVFX = currentTime - tracking.AeroVFXDetectionTime
     local requiredDelay = tracking.AeroCalculatedDelay or aeroConfig.baseParryDelay
-    
+
     if timeSinceVFX < requiredDelay then
-        if aeroConfig.debugMode and math.floor(timeSinceVFX * 5) % 1 == 0 then
-            print(string.format("🌪️ [WAITING VFX] %.2fs / %.2fs", timeSinceVFX, requiredDelay))
-        end
-        return false  -- MUST WAIT - don't parry early
+        return false
     end
-    
+
     -- Check if we're still within tornado duration
     if not IsWithinTornadoDuration() then
-        if aeroConfig.debugMode then
-            print("🌪️ [TIMEOUT] Tornado duration expired")
-        end
         tracking.AeroVFXDetected = false
         return false
     end
-    
+
     -- Speed check (lenient - just ensure ball is moving)
     if currentSpeed < aeroConfig.minSpeedForParry then
-        if aeroConfig.debugMode then
-            print(string.format("🌪️ [SPEED TOO LOW] Current: %d / Required: %d", math.floor(currentSpeed), aeroConfig.minSpeedForParry))
-        end
         return false
     end
-    
+
     -- Alignment check
     local distance = VectorMagnitude(ballPos - playerPos)
     local toPlayer = (playerPos - ballPos)
     local toPlayerMag = VectorMagnitude(toPlayer)
-    
+
     if toPlayerMag < 0.01 then
-        return false  -- Too close to calculate direction
+        return false
     end
-    
+
     local toPlayerNorm = toPlayer / toPlayerMag
     local ballDirNorm = ballVel / currentSpeed
     local alignment = toPlayerNorm.X * ballDirNorm.X + toPlayerNorm.Y * ballDirNorm.Y + toPlayerNorm.Z * ballDirNorm.Z
-    
+
     if alignment >= aeroConfig.alignmentThreshold then
-        print(string.format("🌪️ ✅ AERO VFX PARRY READY | Time: %.2fs | A:%.2f | S:%d | D:%d", 
-            timeSinceVFX, alignment, math.floor(currentSpeed), math.floor(distance)))
-        
-        -- Reset VFX detection
         tracking.AeroVFXDetected = false
         tracking.AeroTornadoStartTime = 0
-        
         return true
-    else
-        if aeroConfig.debugMode and math.random() < 0.2 then
-            print(string.format("🌪️ [ALIGNMENT LOW] Current: %.2f / Required: %.2f", alignment, aeroConfig.alignmentThreshold))
-        end
     end
-    
+
     return false
 end
 
@@ -1129,7 +1108,6 @@ local function GetEquippedAbility()
             local abilityStr = tostring(ability)
             
             if abilityStr ~= _G.AutoParryState.AbilityTracking.CurrentAbility then
-                local oldAbility = _G.AutoParryState.AbilityTracking.CurrentAbility
                 _G.AutoParryState.AbilityTracking.CurrentAbility = abilityStr
                 
                 local abilityLower = abilityStr:lower()
@@ -1151,9 +1129,6 @@ local function GetEquippedAbility()
                     _G.AutoParryState.AbilityTracking.AbilityCooldowns.SlashOfFury = 0
                 end
                 
-                if oldAbility and oldAbility ~= "" then
-                    print(string.format("🔄 Ability changed: %s → %s", oldAbility, abilityStr))
-                end
             end
             
             return abilityStr
@@ -1318,9 +1293,6 @@ RunService.PreLocal:Connect(function()
         if isTargeted and _G.AutoParryState.AbilityTracking.BallFrozen then
             if _G.AutoParryState.Clicked then
                 _G.AutoParryState.Clicked = false
-                if Config.FreezeDebugMode then
-                    print("❄️ Reset clicked - targeted but frozen")
-                end
             end
         end
     end)
@@ -1565,28 +1537,17 @@ RunService.PreLocal:Connect(function()
                 mouse1click()
                 _G.AutoParryState.Clicked = true
                 _G.AutoParryState.LastParryTime = currentTime
-                
-                if Config.FreezeDebugMode then
-                    print("❄️ Freeze parry executed (manual)")
-                end
-                
                 return
             end
         end
-        
+
         -- FREEZE EXPIRATION CHECK - Resume normal parrying after freeze ends
         if _G.AutoParryState.AbilityTracking.FreezeJustExpired then
             local timeSinceExpire = currentTime - _G.AutoParryState.AbilityTracking.FreezeExpireTime
-            
-            -- Clear flag after short time and let normal parry logic handle it
+
             if timeSinceExpire > 0.2 then
                 _G.AutoParryState.AbilityTracking.FreezeJustExpired = false
-                
-                if Config.FreezeDebugMode then
-                    print("❄️ Freeze flag cleared - normal parry resumed")
-                end
             end
-            -- Don't block parrying - let it fall through to normal logic
         end
         
         -- TELEKINESIS ABILITY CHECK - React to redirects
@@ -1702,17 +1663,21 @@ RunService.PreLocal:Connect(function()
         -- Calculate timing
         local adjustedDistance = MAX(0, distance - Config.ParryBufferDistance)
         local timeToReach = adjustedDistance / currentSpeed
-        
+
         local distanceMultiplier, speedAdjustment = GetDistanceSpeedMultiplier(distance, speedForMultiplier)
         local progressiveDistMultiplier = GetProgressiveDistanceMultiplier(distance)
-        
+
+        -- DYNAMIC CURVE & SPEED MULTIPLIER
+        local dynamicMultiplier = GetDynamicCurveMultiplier(ballPos, ballVel, playerPos, currentSpeed)
+
         local baseParryTime = timeToReach * distanceMultiplier
         baseParryTime = baseParryTime * progressiveDistMultiplier
-        
+        baseParryTime = baseParryTime * dynamicMultiplier  -- Apply curve/speed adjustment
+
         if speedAdjustment ~= 0 then
             baseParryTime = baseParryTime - speedAdjustment
         end
-        
+
         baseParryTime = baseParryTime / Config.ParryAggressiveness
         
         local adjustedTimeToReach = baseParryTime
@@ -1728,12 +1693,9 @@ RunService.PreLocal:Connect(function()
             if adjustedTimeToReach <= rapidThreshold and not _G.AutoParryState.Clicked then
                 -- Don't rapid parry if ball is frozen
                 if _G.AutoParryState.AbilityTracking.BallFrozen then
-                    if Config.FreezeDebugMode then
-                        print("❄️ Skipped rapid parry - ball is frozen")
-                    end
                     return
                 end
-                
+
                 local success = ExecuteDynamicClicks(distance, approachVelocity)
 
                 if success then
@@ -1743,28 +1705,21 @@ RunService.PreLocal:Connect(function()
                 end
             end
         end
-        
+
         -- FROZEN BALL PARRY - Allow immediate parry if frozen and targeted
         if canParryFrozen and not _G.AutoParryState.Clicked then
             mouse1click()
             _G.AutoParryState.Clicked = true
             _G.AutoParryState.LastParryTime = currentTime
-            
-            if Config.TelekinesisDebugMode then
-                print("🧊 Parried frozen ball")
-            end
             return
         end
-        
+
         -- Check if time to act
         if adjustedTimeToReach <= _G.AutoParryState.CompensatedParryTime and not _G.AutoParryState.Clicked then
-            
+
             -- FREEZE CHECK: Don't parry if ball is freezing (speed dropping to near 0)
             if _G.AutoParryState.AbilityTracking.BallFrozen then
-                if Config.FreezeDebugMode then
-                    print("❄️ Skipped parry - ball is frozen")
-                end
-                return  -- Ball is frozen, wait for unfreeze
+                return
             end
             
             -- ADDITIONAL SAFETY CHECKS TO PREVENT EARLY PARRY (relaxed)
@@ -2123,7 +2078,7 @@ SettingsTab:CreateSlider({
     Min = 0,
     Max = 1.0,
     Default = Config.PingCompensation,
-    Step = 0.05,
+    Step = 0.01,
     Tooltip = "Multiplier for ping adjustment",
     Callback = function(value)
         Config.PingCompensation = value
@@ -2147,7 +2102,7 @@ SettingsTab:CreateSlider({
     Min = 10,
     Max = 100,
     Default = Config.CloseRangeDistance,
-    Step = 5,
+    Step = 1,
     Suffix = " stud",
     Tooltip = "Distance considered close range",
     Callback = function(value)
