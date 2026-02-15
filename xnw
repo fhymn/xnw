@@ -154,6 +154,10 @@ local Config = {
     
     AutoClashEnabled = true,
     AutoClashDistance = 15,
+    AutoClashPassThreshold = 2,  -- Number of rapid passes to trigger clash mode
+    
+    PanicParryEnabled = true,
+    PanicParryDistance = 20,
 }
 
 local TBSettings = {
@@ -215,6 +219,11 @@ _G.AutoParryState = {
     },
     
     LastParryTime = 0,
+    ClashTracking = {
+        parryTimes = {},
+        isClashing = false,
+        lastClashTime = 0,
+    },
     DeathTracking = {
         wasAlive = true,
         lastDeathSpeed = 0,
@@ -401,7 +410,6 @@ end
 
 local CurveState = {
     ballPositionHistory = {},
-    ballVelocityHistory = {},
     lastCurveLevel = "None",
     lastCurveMultiplier = 1.0,
     curveIntensity = 0,
@@ -413,10 +421,10 @@ local CurveState = {
 
 local CurveMultipliers = {
     None = 1.0,
-    Light = 1.02,
-    Medium = 1.05,
-    Heavy = 1.08,
-    Extreme = 1.12,
+    Light = 1.01,
+    Medium = 1.03,
+    Heavy = 1.05,
+    Extreme = 1.08,
 }
 
 local CurveColors = {
@@ -462,16 +470,20 @@ local function CalculateCurveIntensity(ballPos, ballVel, playerPos)
         return 0, "None"
     end
     
+    -- Check if ball is approaching or moving away
     local toBallNorm = VectorNormalize(toBall)
     local ballVelNorm = VectorNormalize(ballVel)
     local alignment = VectorDot(toBallNorm, ballVelNorm)
     
-    if alignment > -0.25 then
+    -- If ball is moving AWAY from player (positive alignment), skip curve detection
+    if alignment > 0 then
         return 0, "None"
     end
     
+    -- Only detect curves for balls approaching us
     local perpendicular = math.sqrt(math.max(0, 1 - alignment * alignment))
     
+    -- Trajectory deviation detection
     local trajectoryDeviation = 0
     if #CurveState.ballPositionHistory >= 3 then
         local recent = CurveState.ballPositionHistory
@@ -490,35 +502,19 @@ local function CalculateCurveIntensity(ballPos, ballVel, playerPos)
         end
     end
     
-    local velocityDeviation = 0
-    if #CurveState.ballVelocityHistory >= 2 then
-        local recent = CurveState.ballVelocityHistory
-        local vel1 = recent[#recent]
-        local vel2 = recent[#recent - 1]
-        
-        if VectorMagnitude(vel1) > 10 and VectorMagnitude(vel2) > 10 then
-            local vel1Norm = VectorNormalize(vel1)
-            local vel2Norm = VectorNormalize(vel2)
-            velocityDeviation = math.max(0, 1 - VectorDot(vel1Norm, vel2Norm))
-        end
-    end
-    
-    local combinedCurve = (perpendicular * 0.5) + (trajectoryDeviation * 0.35) + (velocityDeviation * 0.15)
-    
-    if ballSpeed > 400 then
-        combinedCurve = combinedCurve * 0.9
-    end
+    -- Simple curve calculation - just perpendicular + trajectory
+    local combinedCurve = (perpendicular * 0.6) + (trajectoryDeviation * 0.4)
     
     CurveState.curveIntensity = combinedCurve
     
     local curveLevel = "None"
-    if combinedCurve > 0.42 then
+    if combinedCurve > 0.35 then
         curveLevel = "Extreme"
-    elseif combinedCurve > 0.32 then
+    elseif combinedCurve > 0.25 then
         curveLevel = "Heavy"
-    elseif combinedCurve > 0.22 then
+    elseif combinedCurve > 0.18 then
         curveLevel = "Medium"
-    elseif combinedCurve > 0.13 then
+    elseif combinedCurve > 0.12 then
         curveLevel = "Light"
     end
     
@@ -532,13 +528,9 @@ end
 
 local function UpdateCurveTracking(ballPos, ballVel)
     table.insert(CurveState.ballPositionHistory, ballPos)
-    table.insert(CurveState.ballVelocityHistory, ballVel)
     
-    while #CurveState.ballPositionHistory > 4 do
+    while #CurveState.ballPositionHistory > 3 do
         table.remove(CurveState.ballPositionHistory, 1)
-    end
-    while #CurveState.ballVelocityHistory > 4 do
-        table.remove(CurveState.ballVelocityHistory, 1)
     end
 end
 
@@ -552,7 +544,6 @@ end
 local function ProcessCurveDetection(ball, playerPos)
     if not ball or not playerPos then
         CurveState.ballPositionHistory = {}
-        CurveState.ballVelocityHistory = {}
         CurveState.lastCurveLevel = "None"
         CurveState.lastCurveMultiplier = 1.0
         CurveState.curveIntensity = 0
@@ -570,7 +561,6 @@ local function ProcessCurveDetection(ball, playerPos)
     
     if ballSpeed < 60 then
         CurveState.ballPositionHistory = {}
-        CurveState.ballVelocityHistory = {}
         CurveState.lastCurveLevel = "None"
         CurveState.lastCurveMultiplier = 1.0
         CurveState.curveIntensity = 0
@@ -1588,12 +1578,22 @@ RunService.PreLocal:Connect(function()
             _G.AutoParryState.BallData.ballRespawnTime = currentTime
             _G.AutoParryState.Clicked = false
             _G.AutoParryState.LastParryTime = 0
+            -- Reset peak speed on respawn
+            _G.AutoParryState.BallTracking.peakSpeed = 0
+            _G.AutoParryState.BallTracking.peakSpeedTime = 0
         end
         
         local ballVel = _G.GetBallVelocity(Ball)
         local currentSpeed = VectorMagnitude(ballVel)
         local lastSpeed = _G.AutoParryState.BallTracking.lastBallSpeed
         local speedDifference = currentSpeed - lastSpeed
+        
+        -- Reset peak speed if ball just respawned and is very slow
+        local timeSinceRespawn = currentTime - _G.AutoParryState.BallData.ballRespawnTime
+        if timeSinceRespawn < 0.5 and currentSpeed < 100 then
+            _G.AutoParryState.BallTracking.peakSpeed = 0
+            _G.AutoParryState.BallTracking.peakSpeedTime = 0
+        end
         
         -- CHECK FOR FREEZE ABILITY
         CheckFreezeAbility()
@@ -1805,39 +1805,56 @@ RunService.PreLocal:Connect(function()
             speedForMultiplier = currentSpeed
         end
         
-        -- AUTO-CLASH: FOV-based proximity detection for clash situations
-        if Config.AutoClashEnabled and isTargeted and not _G.AutoParryState.Clicked then
-            local targetName, targetAbility = GetCurrentBallTarget()
-            if targetName then
-                local aliveFolder = workspace:FindFirstChild("Alive")
-                if aliveFolder then
-                    local targetChar = aliveFolder:FindFirstChild(targetName)
-                    if targetChar then
-                        local targetHRP = targetChar:FindFirstChild("HumanoidRootPart")
-                        if targetHRP then
-                            local targetPos = targetHRP.Position
-                            local ballToPlayer = VectorMagnitude(ballPos - playerPos)
-                            local targetToPlayer = VectorMagnitude(targetPos - playerPos)
-                            local ballToTarget = VectorMagnitude(ballPos - targetPos)
-                            
-                            -- Check if ball and target are both very close (clash scenario)
-                            local clashDistance = Config.AutoClashDistance
-                            if ballToPlayer <= clashDistance and targetToPlayer <= clashDistance * 2 and ballToTarget <= clashDistance then
-                                local movingToward = IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
-                                if movingToward and currentSpeed >= 30 then
-                                    -- Rapid clicking - no delay between clicks
-                                    mouse1click()
-                                    task.wait(0.001)
-                                    mouse1click()
-                                    task.wait(0.001)
-                                    mouse1click()
-                                    _G.AutoParryState.Clicked = true
-                                    _G.AutoParryState.LastParryTime = currentTime
-                                    return
-                                end
-                            end
-                        end
-                    end
+        -- AUTO-CLASH: Record parries in time window (from reference script)
+        local currentTime = tick()
+        local clashState = _G.AutoParryState.ClashTracking
+        
+        -- Clean up old parry records
+        local cutoffTime = currentTime - 0.15  -- 150ms window
+        for i = #clashState.parryTimes, 1, -1 do
+            if clashState.parryTimes[i] < cutoffTime then
+                table.remove(clashState.parryTimes, i)
+            end
+        end
+        
+        -- Check if we should activate clash mode based on parry frequency
+        if #clashState.parryTimes >= Config.AutoClashPassThreshold then
+            local actualTimeSpan = #clashState.parryTimes > 1 and (currentTime - clashState.parryTimes[1]) or 0
+            if actualTimeSpan <= 0.15 then
+                clashState.isClashing = true
+                clashState.lastClashTime = currentTime
+            end
+        end
+        
+        -- Deactivate clash if no activity
+        if clashState.isClashing and (currentTime - clashState.lastClashTime > 0.5) then
+            clashState.isClashing = false
+        end
+        
+        -- SPAM CLICKING when in clash mode
+        if Config.AutoClashEnabled and clashState.isClashing and isTargeted and distance <= Config.AutoClashDistance then
+            -- Pure spam - 5 clicks per frame
+            mouse1click()
+            mouse1click()
+            mouse1click()
+            mouse1click()
+            mouse1click()
+        end
+        
+        -- PANIC PARRY: Instant parry when ball is extremely close regardless of speed (but let abilities handle it if they can)
+        if Config.PanicParryEnabled and distance <= Config.PanicParryDistance and isTargeted and not _G.AutoParryState.Clicked then
+            -- Calculate if normal parry would trigger soon
+            local adjustedDistance = MAX(0, distance - Config.ParryBufferDistance)
+            local timeToReach = adjustedDistance / MAX(currentSpeed, 1)
+            
+            -- Only panic parry if we're NOT already in normal parry window (let abilities trigger)
+            if timeToReach > _G.AutoParryState.CompensatedParryTime then
+                local movingToward = IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
+                if movingToward then
+                    mouse1click()
+                    _G.AutoParryState.Clicked = true
+                    _G.AutoParryState.LastParryTime = currentTime
+                    return
                 end
             end
         end
@@ -1894,10 +1911,25 @@ RunService.PreLocal:Connect(function()
 
         -- DYNAMIC CURVE & SPEED MULTIPLIER
         local dynamicMultiplier = GetDynamicCurveMultiplier(ballPos, ballVel, playerPos, currentSpeed)
+        
+        -- SPEED-BASED REDUCTION: Faster balls = parry earlier
+        local speedReduction = 1.0
+        if currentSpeed >= 1000 then
+            speedReduction = 0.75
+        elseif currentSpeed >= 800 then
+            speedReduction = 0.82
+        elseif currentSpeed >= 600 then
+            speedReduction = 0.88
+        elseif currentSpeed >= 400 then
+            speedReduction = 0.93
+        elseif currentSpeed >= 200 then
+            speedReduction = 0.97
+        end
 
         local baseParryTime = timeToReach * distanceMultiplier
         baseParryTime = baseParryTime * progressiveDistMultiplier
-        baseParryTime = baseParryTime * dynamicMultiplier  -- Apply curve/speed adjustment
+        baseParryTime = baseParryTime * dynamicMultiplier
+        baseParryTime = baseParryTime * speedReduction  -- Apply speed reduction
 
         if speedAdjustment ~= 0 then
             baseParryTime = baseParryTime - speedAdjustment
@@ -2049,6 +2081,8 @@ RunService.PreLocal:Connect(function()
                 if clicksExecuted then
                     _G.AutoParryState.Clicked = true
                     _G.AutoParryState.LastParryTime = tick()
+                    -- Record parry for clash detection
+                    table.insert(_G.AutoParryState.ClashTracking.parryTimes, tick())
                 end
             end
         end
@@ -2137,7 +2171,7 @@ local TBDelaySlider = MainTab:CreateSlider({
     Min = 10,
     Max = 200,
     Default = TBSettings.ClickDelay,
-    Step = 5,
+    Step = 1,
     Suffix = "ms",
     Tooltip = "Delay between trigger bot clicks",
     Callback = function(value)
@@ -2345,7 +2379,7 @@ SettingsTab:CreateSlider({
     Min = 10,
     Max = 100,
     Default = Config.CloseRangeDistance,
-    Step = 1,
+    Step = 0.5,
     Suffix = " stud",
     Tooltip = "Distance considered close range",
     Callback = function(value)
@@ -2404,9 +2438,48 @@ SettingsTab:CreateSlider({
     Default = Config.AutoClashDistance,
     Step = 0.5,
     Suffix = " studs",
-    Tooltip = "Detection radius - triggers when you, ball, and opponent are all close",
+    Tooltip = "Detection radius - triggers when you, ball, and opponents are all close",
     Callback = function(value)
         Config.AutoClashDistance = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Clash Pass Threshold",
+    Min = 2,
+    Max = 5,
+    Default = Config.AutoClashPassThreshold,
+    Step = 1,
+    Suffix = " passes",
+    Tooltip = "Number of rapid back-and-forth passes to activate clash spam",
+    Callback = function(value)
+        Config.AutoClashPassThreshold = value
+    end
+})
+
+SettingsTab:CreateDivider()
+
+SettingsTab:CreateLabel({ Text = "Panic Parry" })
+
+SettingsTab:CreateToggle({
+    Name = "Enable Panic Parry",
+    Default = Config.PanicParryEnabled,
+    Tooltip = "Instant parry when ball gets extremely close (safety net)",
+    Callback = function(value)
+        Config.PanicParryEnabled = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Panic Distance",
+    Min = 5,
+    Max = 45,
+    Default = Config.PanicParryDistance,
+    Step = 0.5,
+    Suffix = " studs",
+    Tooltip = "Instantly parry when ball is closer than this",
+    Callback = function(value)
+        Config.PanicParryDistance = value
     end
 })
 
@@ -2529,33 +2602,16 @@ RunService.Render:Connect(function()
                             local distColor = ESPSettings.DistanceColor
                             local distanceText = distance .. " studs | " .. speed .. " speed"
                             
-                            -- Check for clash conditions
-                            local isClashActive = false
-                            if Config.AutoClashEnabled and distance <= Config.AutoClashDistance then
-                                local targetName, targetAbility = GetCurrentBallTarget()
-                                if targetName then
-                                    local aliveFolder = workspace:FindFirstChild("Alive")
-                                    if aliveFolder then
-                                        local targetChar = aliveFolder:FindFirstChild(targetName)
-                                        if targetChar then
-                                            local targetHRP = targetChar:FindFirstChild("HumanoidRootPart")
-                                            if targetHRP then
-                                                local targetPos = targetHRP.Position
-                                                local targetToPlayer = VectorMagnitude(targetPos - playerPos)
-                                                local ballToTarget = VectorMagnitude(ball.Position - targetPos)
-                                                
-                                                if targetToPlayer <= Config.AutoClashDistance * 2 and ballToTarget <= Config.AutoClashDistance then
-                                                    isClashActive = true
-                                                end
-                                            end
-                                        end
-                                    end
-                                end
-                            end
+                            -- Check clash status
+                            local clashState = _G.AutoParryState.ClashTracking
+                            local parryCount = #clashState.parryTimes
                             
-                            if isClashActive then
+                            if clashState.isClashing and Config.AutoClashEnabled and distance <= Config.AutoClashDistance then
                                 distColor = Color3.fromRGB(255, 0, 255)
-                                distanceText = "⚡ CLASH ACTIVE: " .. distance .. " studs"
+                                distanceText = "⚡ CLASHING [" .. parryCount .. " PARRIES]"
+                            elseif parryCount > 0 and parryCount < Config.AutoClashPassThreshold then
+                                distColor = Color3.fromRGB(255, 165, 0)
+                                distanceText = distance .. " studs | " .. parryCount .. "/" .. Config.AutoClashPassThreshold .. " parries"
                             elseif distance <= 30 then
                                 distColor = Color3.fromRGB(255, 50, 50)
                             elseif distance <= 45 then
@@ -2644,8 +2700,6 @@ RunService.Render:Connect(function()
             end
         end
         
-        local playerPos = GetPlayerPosition()
-        
         for _, character in characters do
             local playerName = character.Name
             
@@ -2658,6 +2712,7 @@ RunService.Render:Connect(function()
                     if onScreen then
                         local abilityText = nil
                         
+                        -- Try Player attribute first
                         local player = Players:FindFirstChild(playerName)
                         if player then
                             local equippedAbility = player:GetAttribute("EquippedAbility")
@@ -2666,6 +2721,7 @@ RunService.Render:Connect(function()
                             end
                         end
                         
+                        -- Try Character attribute
                         if not abilityText then
                             local charAbility = character:GetAttribute("EquippedAbility")
                             if charAbility and tostring(charAbility) ~= "" then
@@ -2673,6 +2729,7 @@ RunService.Render:Connect(function()
                             end
                         end
                         
+                        -- Try HRP attribute
                         if not abilityText then
                             local hrp = character:FindFirstChild("HumanoidRootPart")
                             if hrp then
@@ -2683,14 +2740,15 @@ RunService.Render:Connect(function()
                             end
                         end
                         
+                        -- Update cache if we found something
                         if abilityText and abilityText ~= "" then
                             _ESPAbilityCache[playerName] = abilityText
-                        end
-                        
-                        if (not abilityText or abilityText == "") and _ESPAbilityCache[playerName] then
+                        else
+                            -- Use cache if we couldn't find anything
                             abilityText = _ESPAbilityCache[playerName]
                         end
                         
+                        -- Display ability
                         if abilityText and abilityText ~= "" then
                             DrawingImmediate.OutlinedText(
                                 vector.create(screenPos.X, screenPos.Y - 20),
