@@ -107,7 +107,7 @@ local Config = {
             enabled = true, 
             useOnParry = true,
             qteEnabled = true,
-            qteDelay = 2.45,
+            qteDelay = 2.7,
             qtePressCount = 1,
         },
         SlashOfFury = {
@@ -149,12 +149,16 @@ local Config = {
     TelekinesisVelocityThreshold = 400,
     TelekinesisParryDelay = 0.12,
     
-    CurveDetectionEnabled = true,
-    ShowCurveIndicator = true,
+    CurveDetectionEnabled = false,
+    ShowCurveIndicator = false,
     
     AutoClashEnabled = true,
-    AutoClashDistance = 15,
-    AutoClashPassThreshold = 2,  -- Number of rapid passes to trigger clash mode
+    ClashActivationTime = 0.8,  -- If 3+ parries within 0.8 seconds
+    ClashMinParries = 3,  -- Need at least 3 parries to trigger
+    ClashDeactivationTime = 3.0,  -- Stay active for 3 seconds after LAST PARRY
+    ClashMinSpeed = 60,  -- Minimum speed to count parry
+    ClashExtendOnParry = true,  -- Extend clash mode on each parry
+    ClashSpamDelay = 0,  -- No delay between spam clicks
     
     PanicParryEnabled = true,
     PanicParryDistance = 20,
@@ -219,11 +223,10 @@ _G.AutoParryState = {
     },
     
     LastParryTime = 0,
-    ClashTracking = {
-        parryTimes = {},
-        isClashing = false,
-        lastClashTime = 0,
-    },
+    ClashMode = false,
+    ClashModeActivatedAt = 0,
+    LastClashParryTime = 0,
+    ParryHistory = {},  -- Track all recent parries with timestamps
     DeathTracking = {
         wasAlive = true,
         lastDeathSpeed = 0,
@@ -1196,23 +1199,18 @@ local function GetSpeedAdjustedRapidDistance(speed)
 end
 
 local function ExecuteDynamicClicks(distance, approachVelocity)
-    local clickCount, minDelayMs = GetClickSettings(distance, approachVelocity)
     local currentTime = tick()
     local timeSinceLastClick = (currentTime - _G.AutoParryState.DynamicClick.lastClickTime) * 1000
     
-    if timeSinceLastClick < minDelayMs then
+    if timeSinceLastClick < 50 then
         return false
     end
     
-    for i = 1, clickCount do
-        mouse1click()
-        if i < clickCount and clickCount > 1 then
-            task.wait(0.001)
-        end
-    end
+    -- Single click only to prevent double-clicking issues
+    mouse1click()
     
     _G.AutoParryState.DynamicClick.lastClickTime = currentTime
-    _G.AutoParryState.DynamicClick.clickCount = clickCount
+    _G.AutoParryState.DynamicClick.clickCount = 1
     
     return true
 end
@@ -1682,6 +1680,72 @@ RunService.PreLocal:Connect(function()
     end)
 end)
 
+-- CLASH MODE FUNCTIONS
+local function RecordParry(speed)
+    if speed < Config.ClashMinSpeed then return end
+    
+    local now = tick()
+    table.insert(_G.AutoParryState.ParryHistory, {
+        time = now,
+        speed = speed
+    })
+    
+    -- Clean up old parries (older than activation window)
+    local cutoffTime = now - Config.ClashActivationTime
+    for i = #_G.AutoParryState.ParryHistory, 1, -1 do
+        if _G.AutoParryState.ParryHistory[i].time < cutoffTime then
+            table.remove(_G.AutoParryState.ParryHistory, i)
+        end
+    end
+    
+    -- Update last clash parry time if in clash mode
+    if _G.AutoParryState.ClashMode then
+        _G.AutoParryState.LastClashParryTime = now
+    end
+end
+
+local function CheckClashActivation()
+    local now = tick()
+    
+    -- Count recent parries within activation window
+    local recentParries = 0
+    local cutoffTime = now - Config.ClashActivationTime
+    
+    for _, parry in ipairs(_G.AutoParryState.ParryHistory) do
+        if parry.time >= cutoffTime then
+            recentParries = recentParries + 1
+        end
+    end
+    
+    -- Activate clash mode if threshold met
+    if not _G.AutoParryState.ClashMode and recentParries >= Config.ClashMinParries then
+        _G.AutoParryState.ClashMode = true
+        _G.AutoParryState.ClashModeActivatedAt = now
+        _G.AutoParryState.LastClashParryTime = now
+        
+        pcall(function()
+            send_notification("🔥 CLASH MODE ACTIVATED")
+        end)
+        return true
+    end
+    
+    -- Deactivate if no recent parries
+    if _G.AutoParryState.ClashMode then
+        local timeSinceLastParry = now - _G.AutoParryState.LastClashParryTime
+        
+        if timeSinceLastParry > Config.ClashDeactivationTime then
+            _G.AutoParryState.ClashMode = false
+            
+            pcall(function()
+                send_notification("CLASH MODE ENDED")
+            end)
+            return false
+        end
+    end
+    
+    return _G.AutoParryState.ClashMode
+end
+
 -- AUTO-PARRY LOGIC
 RunService.PreLocal:Connect(function()
     if not _G.AutoParryState.ThreadRunning or not Config.AutoParryEnabled or _G.AutoParryState.AutoclickerMode then
@@ -1805,40 +1869,19 @@ RunService.PreLocal:Connect(function()
             speedForMultiplier = currentSpeed
         end
         
-        -- AUTO-CLASH: Record parries in time window (from reference script)
-        local currentTime = tick()
-        local clashState = _G.AutoParryState.ClashTracking
+        -- CHECK CLASH MODE ACTIVATION
+        CheckClashActivation()
         
-        -- Clean up old parry records
-        local cutoffTime = currentTime - 0.15  -- 150ms window
-        for i = #clashState.parryTimes, 1, -1 do
-            if clashState.parryTimes[i] < cutoffTime then
-                table.remove(clashState.parryTimes, i)
-            end
-        end
-        
-        -- Check if we should activate clash mode based on parry frequency
-        if #clashState.parryTimes >= Config.AutoClashPassThreshold then
-            local actualTimeSpan = #clashState.parryTimes > 1 and (currentTime - clashState.parryTimes[1]) or 0
-            if actualTimeSpan <= 0.15 then
-                clashState.isClashing = true
-                clashState.lastClashTime = currentTime
-            end
-        end
-        
-        -- Deactivate clash if no activity
-        if clashState.isClashing and (currentTime - clashState.lastClashTime > 0.5) then
-            clashState.isClashing = false
-        end
-        
-        -- SPAM CLICKING when in clash mode
-        if Config.AutoClashEnabled and clashState.isClashing and isTargeted and distance <= Config.AutoClashDistance then
-            -- Pure spam - 5 clicks per frame
+        -- CLASH MODE SPAM
+        if Config.AutoClashEnabled and _G.AutoParryState.ClashMode and isTargeted and not _G.AutoParryState.Clicked then
+            -- Continuous spam while in clash mode
             mouse1click()
             mouse1click()
             mouse1click()
             mouse1click()
             mouse1click()
+            _G.AutoParryState.Clicked = true
+            return
         end
         
         -- PANIC PARRY: Instant parry when ball is extremely close regardless of speed (but let abilities handle it if they can)
@@ -1854,33 +1897,40 @@ RunService.PreLocal:Connect(function()
                     mouse1click()
                     _G.AutoParryState.Clicked = true
                     _G.AutoParryState.LastParryTime = currentTime
+                    RecordParry(currentSpeed)
                     return
                 end
             end
         end
         
-        -- Ultra-high speed instant reaction
-        if speedForMultiplier >= 650 and isTargeted and not _G.AutoParryState.Clicked then
-            local shouldInstantParry = false
-            
-            if distance < 35 then
-                shouldInstantParry = true
-            elseif distance < 90 then
-                local movingToward = IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
-                if movingToward and currentSpeed >= 700 then
+        -- HIGH SPEED INSTANT REACTION - 500+ speed needs immediate response
+        if currentSpeed >= 500 and isTargeted and not _G.AutoParryState.Clicked then
+            local movingToward = IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
+            if movingToward then
+                local shouldInstantParry = false
+                
+                if currentSpeed >= 1000 then
+                    -- Extremely fast - instant at any distance
+                    shouldInstantParry = true
+                elseif currentSpeed >= 800 and distance < 60 then
+                    shouldInstantParry = true
+                elseif currentSpeed >= 650 and distance < 45 then
+                    shouldInstantParry = true
+                elseif currentSpeed >= 500 and distance < 35 then
                     shouldInstantParry = true
                 end
-            end
-            
-            if shouldInstantParry then
-                mouse1click()
-                _G.AutoParryState.Clicked = true
-                _G.AutoParryState.LastParryTime = currentTime
-                return
+                
+                if shouldInstantParry then
+                    mouse1click()
+                    _G.AutoParryState.Clicked = true
+                    _G.AutoParryState.LastParryTime = currentTime
+                    RecordParry(currentSpeed)
+                    return
+                end
             end
         end
         
-        -- Mid-range fast ball handling (30-45 studs with high speed)
+        -- Mid-range fast ball handling (30-50 studs with high speed)
         if distance >= 30 and distance <= 50 and currentSpeed >= 400 and isTargeted and not _G.AutoParryState.Clicked then
             local movingToward = IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
             if movingToward then
@@ -1889,6 +1939,7 @@ RunService.PreLocal:Connect(function()
                     mouse1click()
                     _G.AutoParryState.Clicked = true
                     _G.AutoParryState.LastParryTime = currentTime
+                    RecordParry(currentSpeed)
                     return
                 end
             end
@@ -2001,6 +2052,7 @@ RunService.PreLocal:Connect(function()
                     if UseAbility("Infinity", 28) then
                         _G.AutoParryState.Clicked = true
                         abilityUsed = true
+                        RecordParry(currentSpeed)
                     end
                 end
 
@@ -2030,13 +2082,11 @@ RunService.PreLocal:Connect(function()
                     end
                 end
 
-                -- DEATH SLASH
+                -- DEATH SLASH (activates immediately like Raging, then does QTE)
                 if not abilityUsed and abilityLower:find("death") and Config.AutoPopAbilities.DeathSlash.enabled then
-                    if Config.AutoPopAbilities.DeathSlash.useOnParry then
-                        if UseAbility("DeathSlash", 13) then
-                            _G.AutoParryState.Clicked = true
-                            abilityUsed = true
-                        end
+                    if UseAbility("DeathSlash", 13) then
+                        _G.AutoParryState.Clicked = true
+                        abilityUsed = true
                     end
                 end
 
@@ -2081,8 +2131,7 @@ RunService.PreLocal:Connect(function()
                 if clicksExecuted then
                     _G.AutoParryState.Clicked = true
                     _G.AutoParryState.LastParryTime = tick()
-                    -- Record parry for clash detection
-                    table.insert(_G.AutoParryState.ClashTracking.parryTimes, tick())
+                    RecordParry(currentSpeed)
                 end
             end
         end
@@ -2432,28 +2481,41 @@ SettingsTab:CreateToggle({
 })
 
 SettingsTab:CreateSlider({
-    Name = "Auto-Clash Distance",
-    Min = 5,
-    Max = 25,
-    Default = Config.AutoClashDistance,
-    Step = 0.5,
-    Suffix = " studs",
-    Tooltip = "Detection radius - triggers when you, ball, and opponents are all close",
+    Name = "Clash Min Parries",
+    Min = 2,
+    Max = 5,
+    Default = Config.ClashMinParries,
+    Step = 1,
+    Suffix = " parries",
+    Tooltip = "Number of parries within time window to activate clash mode",
     Callback = function(value)
-        Config.AutoClashDistance = value
+        Config.ClashMinParries = value
     end
 })
 
 SettingsTab:CreateSlider({
-    Name = "Clash Pass Threshold",
-    Min = 2,
-    Max = 5,
-    Default = Config.AutoClashPassThreshold,
-    Step = 1,
-    Suffix = " passes",
-    Tooltip = "Number of rapid back-and-forth passes to activate clash spam",
+    Name = "Clash Activation Time",
+    Min = 0.5,
+    Max = 2.0,
+    Default = Config.ClashActivationTime,
+    Step = 0.1,
+    Suffix = "s",
+    Tooltip = "Time window to count parries for clash activation",
     Callback = function(value)
-        Config.AutoClashPassThreshold = value
+        Config.ClashActivationTime = value
+    end
+})
+
+SettingsTab:CreateSlider({
+    Name = "Clash Duration",
+    Min = 1.0,
+    Max = 5.0,
+    Default = Config.ClashDeactivationTime,
+    Step = 0.5,
+    Suffix = "s",
+    Tooltip = "How long clash mode stays active after last parry",
+    Callback = function(value)
+        Config.ClashDeactivationTime = value
     end
 })
 
@@ -2603,15 +2665,22 @@ RunService.Render:Connect(function()
                             local distanceText = distance .. " studs | " .. speed .. " speed"
                             
                             -- Check clash status
-                            local clashState = _G.AutoParryState.ClashTracking
-                            local parryCount = #clashState.parryTimes
+                            local now = tick()
+                            local recentParries = 0
+                            for _, parry in ipairs(_G.AutoParryState.ParryHistory) do
+                                if now - parry.time <= Config.ClashActivationTime then
+                                    recentParries = recentParries + 1
+                                end
+                            end
                             
-                            if clashState.isClashing and Config.AutoClashEnabled and distance <= Config.AutoClashDistance then
+                            if _G.AutoParryState.ClashMode and Config.AutoClashEnabled then
+                                local timeSinceLastParry = now - _G.AutoParryState.LastClashParryTime
+                                local timeLeft = Config.ClashDeactivationTime - timeSinceLastParry
                                 distColor = Color3.fromRGB(255, 0, 255)
-                                distanceText = "⚡ CLASHING [" .. parryCount .. " PARRIES]"
-                            elseif parryCount > 0 and parryCount < Config.AutoClashPassThreshold then
+                                distanceText = string.format("⚡ CLASH ACTIVE [%.1fs]", math.max(0, timeLeft))
+                            elseif recentParries > 0 then
                                 distColor = Color3.fromRGB(255, 165, 0)
-                                distanceText = distance .. " studs | " .. parryCount .. "/" .. Config.AutoClashPassThreshold .. " parries"
+                                distanceText = string.format("%d studs | %d/%d parries", distance, recentParries, Config.ClashMinParries)
                             elseif distance <= 30 then
                                 distColor = Color3.fromRGB(255, 50, 50)
                             elseif distance <= 45 then
