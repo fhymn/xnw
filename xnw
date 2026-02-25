@@ -2,6 +2,7 @@
 
 -- Who's AP? w6lv (UI By X) - INTEGRATED VERSION
 -- Old auto-parry logic + Old clash system + New features
+-- + Manual Clash + Triggerbot + Advanced Curve Detection
 
 local function VectorMagnitude(v)
     return math.sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z)
@@ -169,9 +170,29 @@ local Config = {
     TelekinesisVelocityThreshold = 400,
     TelekinesisParryDelay = 0.12,
     
-    CurveDetectionEnabled = false,
-    ShowCurveIndicator = false,
-    
+    -- ==========================================
+    -- CURVE DETECTION (Advanced - from reference script)
+    -- Uses angular direction history, not lateral deltas
+    -- ==========================================
+    EnableCurveDetection = true,
+    ShowCurveIndicator = true,
+    CurveAngleThreshold = 15,       -- Degrees of avg angle change to flag curve
+    CurveCheckWindow = 3,           -- Number of direction samples to compare
+    CurveDelayFactor = 0.3,         -- How much to reduce parry multiplier when curving (0-1)
+    MinCurveSpeed = 150,            -- Min ball speed to even check for curves
+    VelocitySampleRate = 0.03,      -- How often to sample ball position for velocity
+
+    -- ==========================================
+    -- ADVANCED PREDICTION (from reference script)
+    -- ==========================================
+    EnableDynamicPrediction = true,
+    BaseParryWindow = 0.35,
+    MinParryWindow = 0.15,
+    SpeedThresholdLow = 100,
+    SpeedThresholdHigh = 400,
+    MaxPredictionMultiplier = 3.3,
+    PredictionCurve = 1.1,
+
     -- OLD CLASH SYSTEM (REDESIGNED - from old script)
     AutoClashEnabled = true,
     ClashActivationTime = 0.8,  -- If 3+ parries within 0.8 seconds
@@ -181,6 +202,19 @@ local Config = {
     ClashExtendOnParry = true,  -- Extend clash mode on each parry
     ClashSpamDelay = 0,  -- No delay between spam clicks
     
+    -- MANUAL CLASH (from reference script)
+    ManualClashEnabled = true,
+    ManualClashFKeyCode = 0x46,         -- F key
+    ManualClashClicksPerBurst = 10,     -- Clicks per burst
+    ManualClashBurstCooldown = 0.008,   -- How fast bursts fire (seconds)
+
+    -- TRIGGERBOT (from reference script)
+    TriggerbotEnabled = false,          -- Default off, toggled via UI
+    TriggerbotClickCooldown = 0.05,     -- Min time between triggerbot clicks
+    TriggerbotMultiClick = false,       -- Fire multiple clicks per trigger
+    TriggerbotClickCount = 1,
+    TriggerbotClickDelay = 0.0005,
+
     PanicParryEnabled = true,
     PanicParryDistance = 20,
 }
@@ -214,6 +248,15 @@ _G.AutoParryState = {
     ThreadRunning = true,
     CompensatedParryTime = 0.47,
     LastPingUpdate = 0,
+    
+    -- MANUAL CLASH STATE
+    ManualClashMode = false,
+    
+    -- TRIGGERBOT STATE
+    TriggerbotMode = false,
+    TriggerbotParried = false,
+    LastTriggerbotNotif = 0,
+    
     BallData = {
         isTargeted = false,
         lastSpeed = 0,
@@ -226,6 +269,9 @@ _G.AutoParryState = {
         wasTargetedLastFrame = false,
         ballExists = false,
         ballRespawnTime = 0,
+        -- Curve tracking (reference script style)
+        lastBallPos = nil,
+        lastBallPosTime = 0,
     },
     BallTracking = {
         lastBallSpeed = 0,
@@ -375,16 +421,6 @@ local function IsTargeted()
     return targeted
 end
 
-local function IsTargetedDirect()
-    local aliveFolder = workspace:FindFirstChild("Alive")
-    if not aliveFolder then return false end
-    
-    local playerModel = aliveFolder:FindFirstChild(_G.AutoParryState.LocalPlayer.Name)
-    if not playerModel then return false end
-    
-    return playerModel:FindFirstChild("Highlight") ~= nil
-end
-
 local function IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
     local toPlayer = playerPos - ballPos
     local toPlayerMag = VectorMagnitude(toPlayer)
@@ -419,173 +455,165 @@ local function IsBallComingTowardsPlayer(ballPos, ballVel, playerPos)
     return dotProduct > threshold
 end
 
-local CurveState = {
-    ballPositionHistory = {},
-    lastCurveLevel = "None",
-    lastCurveMultiplier = 1.0,
-    curveIntensity = 0,
-    curveDirection = vector.create(0, 0, 0),
-    lastDisplayLevel = "None",
-    lastDisplayIntensity = 0,
-    lastBallExists = false,
+-- ==========================================
+-- ADVANCED CURVE DETECTION (from reference script)
+-- Uses direction history and angular change — proven reliable approach.
+-- Integrates into the parry window multiplier rather than adding raw delays.
+-- ==========================================
+
+-- Shared BallTracking for curve + velocity (mirrors reference script's BallTracking table)
+local BallTrackingCurve = {
+    LastPosition = nil,
+    LastPositionTime = 0,
+    CurrentVelocity = {X = 0, Y = 0, Z = 0},
+    VelocityHistory = {},
+    DirectionHistory = {},
+    LastDirection = nil,
+    CurveDetected = false,
+    CurveStrength = 0,
+    LastCurveCheck = 0,
 }
 
-local CurveMultipliers = {
-    None = 1.0,
-    Light = 1.01,
-    Medium = 1.03,
-    Heavy = 1.05,
-    Extreme = 1.08,
-}
-
-local CurveColors = {
-    None = Color3.fromRGB(255, 255, 255),
-    Light = Color3.fromRGB(255, 255, 0),
-    Medium = Color3.fromRGB(255, 165, 0),
-    Heavy = Color3.fromRGB(255, 69, 0),
-    Extreme = Color3.fromRGB(255, 0, 0),
-}
-
-local function VectorNormalize(v)
-    local mag = VectorMagnitude(v)
-    if mag < 0.001 then return vector.create(0, 0, 0) end
-    return vector.create(v.X / mag, v.Y / mag, v.Z / mag)
+local function NormalizeVec3(v)
+    local mag = math.sqrt(v.X*v.X + v.Y*v.Y + v.Z*v.Z)
+    if mag > 0 then return {X = v.X/mag, Y = v.Y/mag, Z = v.Z/mag} end
+    return {X = 0, Y = 0, Z = 0}
 end
 
-local function VectorDot(v1, v2)
-    return v1.X * v2.X + v1.Y * v2.Y + v1.Z * v2.Z
+local function DotVec3(a, b)
+    return a.X*b.X + a.Y*b.Y + a.Z*b.Z
 end
 
-local function VectorCross(v1, v2)
-    return vector.create(
-        v1.Y * v2.Z - v1.Z * v2.Y,
-        v1.Z * v2.X - v1.X * v2.Z,
-        v1.X * v2.Y - v1.Y * v2.X
-    )
+local function AngleBetweenDirs(v1, v2)
+    local dot = DotVec3(v1, v2)
+    local mag1 = math.sqrt(v1.X^2 + v1.Y^2 + v1.Z^2)
+    local mag2 = math.sqrt(v2.X^2 + v2.Y^2 + v2.Z^2)
+    if mag1 > 0 and mag2 > 0 then
+        local cosA = math.max(-1, math.min(1, dot / (mag1 * mag2)))
+        return math.deg(math.acos(cosA))
+    end
+    return 0
 end
 
-local function CalculateCurveIntensity(ballPos, ballVel, playerPos)
-    if not Config.CurveDetectionEnabled then
-        return 0, "None"
+-- Call this every frame with the current ball to keep direction history updated
+local function UpdateBallVelocityAndCurve(ball)
+    if not ball then return {X=0,Y=0,Z=0} end
+    local currentTime = tick()
+    local currentPos = ball.Position
+
+    if BallTrackingCurve.LastPosition and
+       (currentTime - BallTrackingCurve.LastPositionTime) >= Config.VelocitySampleRate then
+
+        local dt = currentTime - BallTrackingCurve.LastPositionTime
+        local lp = BallTrackingCurve.LastPosition
+        local vx = (currentPos.X - lp.X) / dt
+        local vy = (currentPos.Y - lp.Y) / dt
+        local vz = (currentPos.Z - lp.Z) / dt
+
+        BallTrackingCurve.CurrentVelocity = {X = vx, Y = vy, Z = vz}
+        local speed = math.sqrt(vx*vx + vy*vy + vz*vz)
+
+        table.insert(BallTrackingCurve.VelocityHistory, {X = vx, Y = vy, Z = vz, time = currentTime})
+        if #BallTrackingCurve.VelocityHistory > 10 then
+            table.remove(BallTrackingCurve.VelocityHistory, 1)
+        end
+
+        if speed > Config.MinParrySpeed then
+            local dir = NormalizeVec3({X=vx, Y=vy, Z=vz})
+            table.insert(BallTrackingCurve.DirectionHistory, dir)
+            if #BallTrackingCurve.DirectionHistory > Config.CurveCheckWindow + 2 then
+                table.remove(BallTrackingCurve.DirectionHistory, 1)
+            end
+            BallTrackingCurve.LastDirection = dir
+        end
+
+        BallTrackingCurve.LastPosition = currentPos
+        BallTrackingCurve.LastPositionTime = currentTime
+    elseif not BallTrackingCurve.LastPosition then
+        BallTrackingCurve.LastPosition = currentPos
+        BallTrackingCurve.LastPositionTime = currentTime
     end
-    
-    local ballSpeed = VectorMagnitude(ballVel)
-    if ballSpeed < 60 then
-        return 0, "None"
+
+    return BallTrackingCurve.CurrentVelocity
+end
+
+-- Returns: curveDetected (bool), curveStrength (0-1)
+local function DetectCurve()
+    if not Config.EnableCurveDetection then
+        return false, 0
     end
-    
-    local toBall = ballPos - playerPos
-    local distanceToPlayer = VectorMagnitude(toBall)
-    
-    if distanceToPlayer < 5 then
-        return 0, "None"
+
+    local now = tick()
+    -- Cache result for 50ms so we don't spam recalculation
+    if now - BallTrackingCurve.LastCurveCheck < 0.05 then
+        return BallTrackingCurve.CurveDetected, BallTrackingCurve.CurveStrength
     end
-    
-    local toBallNorm = VectorNormalize(toBall)
-    local ballVelNorm = VectorNormalize(ballVel)
-    local alignment = VectorDot(toBallNorm, ballVelNorm)
-    
-    if alignment > 0 then
-        return 0, "None"
+    BallTrackingCurve.LastCurveCheck = now
+
+    if #BallTrackingCurve.DirectionHistory < Config.CurveCheckWindow then
+        return false, 0
     end
-    
-    local perpendicular = math.sqrt(math.max(0, 1 - alignment * alignment))
-    
-    local trajectoryDeviation = 0
-    if #CurveState.ballPositionHistory >= 3 then
-        local recent = CurveState.ballPositionHistory
-        local pos1 = recent[#recent]
-        local pos2 = recent[#recent - 1]
-        local pos3 = recent[#recent - 2]
-        
-        local expectedMove = vector.create(pos2.X - pos3.X, pos2.Y - pos3.Y, pos2.Z - pos3.Z)
-        local actualMove = vector.create(pos1.X - pos2.X, pos1.Y - pos2.Y, pos1.Z - pos2.Z)
-        
-        local expectedNorm = VectorNormalize(expectedMove)
-        local actualNorm = VectorNormalize(actualMove)
-        
-        if VectorMagnitude(expectedMove) > 1 and VectorMagnitude(actualMove) > 1 then
-            trajectoryDeviation = math.max(0, 1 - VectorDot(expectedNorm, actualNorm))
+
+    local totalAngle = 0
+    local maxAngle = 0
+    local samples = 0
+
+    for i = #BallTrackingCurve.DirectionHistory - Config.CurveCheckWindow + 1,
+             #BallTrackingCurve.DirectionHistory - 1 do
+        local d1 = BallTrackingCurve.DirectionHistory[i]
+        local d2 = BallTrackingCurve.DirectionHistory[i + 1]
+        if d1 and d2 then
+            local angle = AngleBetweenDirs(d1, d2)
+            totalAngle = totalAngle + angle
+            maxAngle = math.max(maxAngle, angle)
+            samples = samples + 1
         end
     end
-    
-    local combinedCurve = (perpendicular * 0.6) + (trajectoryDeviation * 0.4)
-    
-    CurveState.curveIntensity = combinedCurve
-    
-    local curveLevel = "None"
-    if combinedCurve > 0.35 then
-        curveLevel = "Extreme"
-    elseif combinedCurve > 0.25 then
-        curveLevel = "Heavy"
-    elseif combinedCurve > 0.18 then
-        curveLevel = "Medium"
-    elseif combinedCurve > 0.12 then
-        curveLevel = "Light"
-    end
-    
-    if VectorMagnitude(ballVel) > 1 then
-        local crossProd = VectorCross(ballVelNorm, toBallNorm)
-        CurveState.curveDirection = VectorNormalize(crossProd)
-    end
-    
-    return combinedCurve, curveLevel
+
+    if samples == 0 then return false, 0 end
+
+    local avgAngle = totalAngle / samples
+    local detected = avgAngle > Config.CurveAngleThreshold
+    local strength = math.min(avgAngle / (Config.CurveAngleThreshold * 2), 1)
+
+    BallTrackingCurve.CurveDetected = detected
+    BallTrackingCurve.CurveStrength = strength
+
+    return detected, strength
 end
 
-local function UpdateCurveTracking(ballPos, ballVel)
-    table.insert(CurveState.ballPositionHistory, ballPos)
-    
-    while #CurveState.ballPositionHistory > 3 do
-        table.remove(CurveState.ballPositionHistory, 1)
+-- Returns the prediction multiplier for parry window (with curve compensation baked in)
+local function CalculatePredictionMultiplier(speed, distance)
+    if not Config.EnableDynamicPrediction then return 1.0 end
+
+    local mult
+    if speed <= Config.SpeedThresholdLow then
+        mult = 1.0
+    elseif speed >= Config.SpeedThresholdHigh then
+        mult = Config.MaxPredictionMultiplier
+    else
+        local range = Config.SpeedThresholdHigh - Config.SpeedThresholdLow
+        local factor = (speed - Config.SpeedThresholdLow) / range
+        factor = math.pow(factor, Config.PredictionCurve)
+        mult = 1.0 + (Config.MaxPredictionMultiplier - 1.0) * factor
     end
+
+    -- Curve compensation: if curving, reduce multiplier so we wait a touch longer
+    if speed > Config.MinCurveSpeed then
+        local curveDetected, curveStrength = DetectCurve()
+        if curveDetected then
+            mult = mult * (1.0 - Config.CurveDelayFactor * curveStrength)
+        end
+    end
+
+    return mult
 end
 
-local function GetCurveTimingMultiplier(ballPos, ballVel, playerPos)
-    local curveIntensity, curveLevel = CalculateCurveIntensity(ballPos, ballVel, playerPos)
-    CurveState.lastCurveLevel = curveLevel
-    CurveState.lastCurveMultiplier = CurveMultipliers[curveLevel]
-    return CurveState.lastCurveMultiplier
-end
-
-local function ProcessCurveDetection(ball, playerPos)
-    if not ball or not playerPos then
-        CurveState.ballPositionHistory = {}
-        CurveState.lastCurveLevel = "None"
-        CurveState.lastCurveMultiplier = 1.0
-        CurveState.curveIntensity = 0
-        CurveState.lastDisplayLevel = "None"
-        CurveState.lastDisplayIntensity = 0
-        CurveState.lastBallExists = false
-        return 1.0
-    end
-    
-    CurveState.lastBallExists = true
-    
-    local ballPos = ball.Position
-    local ballVel = _G.GetBallVelocity(ball)
-    local ballSpeed = VectorMagnitude(ballVel)
-    
-    if ballSpeed < 60 then
-        CurveState.ballPositionHistory = {}
-        CurveState.lastCurveLevel = "None"
-        CurveState.lastCurveMultiplier = 1.0
-        CurveState.curveIntensity = 0
-        CurveState.lastDisplayLevel = "None"
-        CurveState.lastDisplayIntensity = 0
-        return 1.0
-    end
-    
-    UpdateCurveTracking(ballPos, ballVel)
-    local multiplier = GetCurveTimingMultiplier(ballPos, ballVel, playerPos)
-    
-    CurveState.lastDisplayLevel = CurveState.lastCurveLevel
-    CurveState.lastDisplayIntensity = CurveState.curveIntensity
-    
-    return multiplier
-end
-
-local function GetDynamicCurveMultiplier(ballPos, ballVel, playerPos, currentSpeed)
-    return ProcessCurveDetection(GetCurrentBall(), playerPos)
+-- Returns the full dynamic parry window (seconds)
+local function GetDynamicParryWindow(speed, distance)
+    local mult = CalculatePredictionMultiplier(speed, distance)
+    local window = Config.BaseParryWindow * mult
+    return math.max(Config.MinParryWindow, window)
 end
 
 local function ShouldCheckDirection(distance)
@@ -1393,7 +1421,7 @@ RunService.PreLocal:Connect(function()
     mouse1click()
 end)
 
--- TRIGGER BOT
+-- LEGACY TRIGGER BOT (original simple version, kept for compatibility)
 RunService.PreLocal:Connect(function()
     if not TBSettings.Enabled then
         TBSettings.HasClicked = false
@@ -1415,6 +1443,128 @@ RunService.PreLocal:Connect(function()
         TBSettings.HasClicked = false
     end
 end)
+
+-- ==========================================
+-- NEW TRIGGERBOT SYSTEM (from reference script)
+-- Event-based (instant) + loop fallback
+-- ==========================================
+
+local TriggerbotEventConnection = nil
+local TriggerbotLastClickTime = 0
+
+local function TriggerbotDoClick()
+    if Config.TriggerbotMultiClick then
+        for i = 1, Config.TriggerbotClickCount do
+            mouse1click()
+            if i < Config.TriggerbotClickCount then
+                task.wait(Config.TriggerbotClickDelay)
+            end
+        end
+    else
+        mouse1click()
+    end
+end
+
+local function StartTriggerbot()
+    -- Disconnect any existing connection
+    if TriggerbotEventConnection then
+        pcall(function() TriggerbotEventConnection:Disconnect() end)
+        TriggerbotEventConnection = nil
+    end
+
+    -- METHOD 1: Event-based (fires the instant highlight is added — 0ms delay)
+    local function SetupEventDetection()
+        pcall(function()
+            local playerModel = _G.AutoParryState.CachedPlayerModel
+            if not playerModel then return end
+
+            if TriggerbotEventConnection then
+                pcall(function() TriggerbotEventConnection:Disconnect() end)
+                TriggerbotEventConnection = nil
+            end
+
+            TriggerbotEventConnection = playerModel.ChildAdded:Connect(function(child)
+                if not Config.AutoParryEnabled or not _G.AutoParryState.TriggerbotMode then return end
+                pcall(function()
+                    if child.Name == "Highlight" and child:IsA("Highlight") then
+                        local now = tick()
+                        if now - TriggerbotLastClickTime > Config.TriggerbotClickCooldown then
+                            TriggerbotLastClickTime = now
+                            TriggerbotDoClick()
+                            _G.AutoParryState.TriggerbotParried = true
+                            pcall(function()
+                                local lastNotif = _G.AutoParryState.LastTriggerbotNotif or 0
+                                if now - lastNotif > 1 then
+                                    send_notification("⚡ TRIGGERBOT (Event)")
+                                    _G.AutoParryState.LastTriggerbotNotif = now
+                                end
+                            end)
+                        end
+                    end
+                end)
+            end)
+        end)
+    end
+
+    SetupEventDetection()
+
+    -- METHOD 2: Loop fallback (~1ms response, catches anything the event misses)
+    task.spawn(function()
+        local highlightDetected = false
+
+        while task.wait(0) do
+            if not Config.AutoParryEnabled or not _G.AutoParryState.TriggerbotMode then
+                task.wait(0.1)
+                highlightDetected = false
+                continue
+            end
+
+            pcall(function()
+                local now = tick()
+                local playerModel = _G.AutoParryState.CachedPlayerModel
+
+                -- Re-establish event if player model refreshed
+                if playerModel and not TriggerbotEventConnection then
+                    SetupEventDetection()
+                end
+
+                if not playerModel then
+                    highlightDetected = false
+                    return
+                end
+
+                local highlight = playerModel:FindFirstChild("Highlight")
+
+                if highlight then
+                    if not highlightDetected then
+                        highlightDetected = true
+                        if now - TriggerbotLastClickTime > Config.TriggerbotClickCooldown then
+                            TriggerbotLastClickTime = now
+                            TriggerbotDoClick()
+                            _G.AutoParryState.TriggerbotParried = true
+                            pcall(function()
+                                local lastNotif = _G.AutoParryState.LastTriggerbotNotif or 0
+                                if now - lastNotif > 1 then
+                                    send_notification("⚡ TRIGGERBOT (Loop)")
+                                    _G.AutoParryState.LastTriggerbotNotif = now
+                                end
+                            end)
+                        end
+                    end
+                else
+                    highlightDetected = false
+                end
+            end)
+        end
+    end)
+end
+
+local function StopTriggerbot()
+    if TriggerbotEventConnection then
+        pcall(function() TriggerbotEventConnection:Disconnect() end)
+        TriggerbotEventConnection = nil
+    end
+end
 
 -- MARTYRDOM TRACKING
 RunService.PreLocal:Connect(function()
@@ -1463,7 +1613,7 @@ RunService.PreLocal:Connect(function()
     end)
 end)
 
--- BALL TRACKING
+-- BALL TRACKING (with reworked curve detection)
 RunService.PreLocal:Connect(function()
     if not _G.AutoParryState.ThreadRunning then return end
     
@@ -1480,6 +1630,12 @@ RunService.PreLocal:Connect(function()
             _G.AutoParryState.BallData.lastBallPosition = nil
             _G.AutoParryState.BallData.approachVelocity = 0
             _G.AutoParryState.BallTracking.peakSpeed = 0
+            -- Reset curve state when no ball
+            BallTrackingCurve.LastPosition = nil
+            BallTrackingCurve.VelocityHistory = {}
+            BallTrackingCurve.DirectionHistory = {}
+            BallTrackingCurve.CurveDetected = false
+            BallTrackingCurve.CurveStrength = 0
             return
         end
 
@@ -1490,6 +1646,17 @@ RunService.PreLocal:Connect(function()
             _G.AutoParryState.LastParryTime = 0
             _G.AutoParryState.BallTracking.peakSpeed = 0
             _G.AutoParryState.BallTracking.peakSpeedTime = 0
+            BallTrackingCurve.LastPosition = nil
+            BallTrackingCurve.VelocityHistory = {}
+            BallTrackingCurve.DirectionHistory = {}
+            BallTrackingCurve.CurveDetected = false
+            BallTrackingCurve.CurveStrength = 0
+            -- Always kill clash mode on ball respawn — previous round's
+            -- LastClashParryTime would keep spam running into the new round
+            -- and block normal parrying until the timer expires.
+            _G.AutoParryState.ClashMode = false
+            _G.AutoParryState.ParryHistory = {}
+            _G.AutoParryState.LastClashParryTime = 0
         end
         
         local ballVel = _G.GetBallVelocity(Ball)
@@ -1545,6 +1712,11 @@ RunService.PreLocal:Connect(function()
             end
             
             _G.AutoParryState.BallData.lastBallPosition = ballPos
+
+            -- ADVANCED CURVE DETECTION (reference script approach)
+            if Config.EnableCurveDetection then
+                UpdateBallVelocityAndCurve(Ball)
+            end
         end
         
         _G.AutoParryState.BallTracking.lastBallSpeed = currentSpeed
@@ -1696,8 +1868,16 @@ task.spawn(function()
                 if _G.AutoParryState.ClashMode then
                     local timeSinceLastParry = now - _G.AutoParryState.LastClashParryTime
                     
+                    -- Also deactivate if the ball just respawned (respawn resets ClashMode,
+                    -- but this is a belt-and-suspenders check)
+                    local timeSinceRespawn = now - (_G.AutoParryState.BallData.ballRespawnTime or 0)
+                    
                     if timeSinceLastParry > Config.ClashDeactivationTime then
                         _G.AutoParryState.ClashMode = false
+                    elseif timeSinceRespawn < 0.4 then
+                        -- Ball just respawned — hold off for 400ms so normal
+                        -- parry logic has priority at the start of the new round
+                        return
                     elseif isTargeted and not _G.AutoParryState.AbilityTracking.BallFrozen then
                         -- Continuous spam clicks
                         mouse1click()
@@ -1710,9 +1890,43 @@ task.spawn(function()
     end
 end)
 
--- INTEGRATED AUTO-PARRY LOGIC (OLD + NEW)
+-- ==========================================
+-- MANUAL CLASH (from reference script)
+-- Ultra-fast loop: 10 clicks + F key per burst when targeted
+-- ==========================================
+
+task.spawn(function()
+    local lastBurstTime = 0
+
+    while true do
+        task.wait(0)
+        if Config.AutoParryEnabled and Config.ManualClashEnabled and _G.AutoParryState.ManualClashMode then
+            local isTargeted = _G.AutoParryState.BallData.isTargeted
+            if isTargeted then
+                local now = tick()
+                if (now - lastBurstTime) >= Config.ManualClashBurstCooldown then
+                    lastBurstTime = now
+                    pcall(function()
+                        keypress(Config.ManualClashFKeyCode)
+                        for _ = 1, Config.ManualClashClicksPerBurst do
+                            mouse1click()
+                        end
+                        keyrelease(Config.ManualClashFKeyCode)
+                    end)
+                end
+            end
+        end
+    end
+end)
+
+-- INTEGRATED AUTO-PARRY LOGIC (OLD + NEW, with curve delay applied non-destructively)
 RunService.PreLocal:Connect(function()
     if not _G.AutoParryState.ThreadRunning or not Config.AutoParryEnabled or _G.AutoParryState.AutoclickerMode then
+        return
+    end
+
+    -- Triggerbot and manual clash run independently; skip normal AP logic for them
+    if _G.AutoParryState.TriggerbotMode then
         return
     end
     
@@ -1871,12 +2085,12 @@ RunService.PreLocal:Connect(function()
             end
         end
         
-        -- Calculate time to reach (OLD METHOD)
+        -- Calculate time to reach (uses new dynamic parry window with curve baked in)
         local adjustedDistance = math.max(0, distance - Config.ParryBufferDistance)
         local timeToReach = adjustedDistance / currentSpeed
         
-        -- Get OLD dynamic parry time based on speed
-        local parryTime = GetParryTime(currentSpeed)
+        -- Get dynamic parry window (reference script approach — curve compensation integrated)
+        local parryTime = GetDynamicParryWindow(currentSpeed, distance)
         
         -- Parry if within time window
         if timeToReach <= parryTime then
@@ -1983,7 +2197,7 @@ RunService.PreLocal:Connect(function()
     end)
 end)
 
--- UI (Same as before - keeping the entire UI from the new script)
+-- UI
 local UiLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/xposn/ui/refs/heads/main/UiLib.lua"))()
 
 local camera = game:GetService("Workspace").CurrentCamera
@@ -1995,7 +2209,7 @@ local centerY = (screenSize.Y - menuHeight) / 2
 
 local Window = UiLib:CreateWindow({
     Title = "Who's AP? (INTEGRATED)                                                w6lv (UI By X)",
-    Subtitle = "F3 to toggle - Old AP + Old Clash",
+    Subtitle = "F3 to toggle - Old AP + Old Clash + Manual Clash + Triggerbot",
     Position = Vector2.new(centerX, centerY),
     Width = menuWidth,
     ToggleKey = "F3"
@@ -2015,6 +2229,12 @@ local AutoParryToggle = MainTab:CreateToggle({
     Tooltip = "OLD Auto-Parry Logic (Dynamic Timing)",
     Callback = function(value)
         Config.AutoParryEnabled = value
+        if not value then
+            -- Disable manual clash and triggerbot when AP is off
+            _G.AutoParryState.ManualClashMode = false
+            _G.AutoParryState.TriggerbotMode = false
+            StopTriggerbot()
+        end
     end
 })
 
@@ -2034,39 +2254,95 @@ local AutoParryKeybind = MainTab:CreateKeybind({
 
 MainTab:CreateDivider()
 
-local TBToggle = MainTab:CreateToggle({
-    Name = "Trigger Bot",
-    Default = TBSettings.Enabled,
-    Tooltip = "Auto-click when holding TB key",
+-- MANUAL CLASH TOGGLE
+local ManualClashToggle = MainTab:CreateToggle({
+    Name = "Manual Clash",
+    Default = _G.AutoParryState.ManualClashMode,
+    Tooltip = "Ultra-fast click + F key spam when targeted. Works alongside auto-parry.",
     Callback = function(value)
-        TBSettings.Enabled = value
+        if Config.AutoParryEnabled then
+            _G.AutoParryState.ManualClashMode = value
+            pcall(function()
+                send_notification("Manual Clash " .. (value and "ON" or "OFF"))
+            end)
+        end
     end
 })
 
-local TBKeybind = MainTab:CreateKeybind({
-    Name = "TB Keybind",
-    Default = TBSettings.Keybind,
-    Mode = "toggle",
-    LinkedToggle = TBToggle,
-    Tooltip = "Toggle trigger bot on/off",
-    Callback = function(key)
-        TBSettings.Keybind = key
-    end,
-    ActivateCallback = function(active)
-        TBSettings.Enabled = active
-    end
-})
-
-local TBDelaySlider = MainTab:CreateSlider({
-    Name = "Click Delay",
-    Min = 10,
-    Max = 200,
-    Default = TBSettings.ClickDelay,
+local ManualClashClicksSlider = MainTab:CreateSlider({
+    Name = "Clash Clicks Per Burst",
+    Min = 1,
+    Max = 20,
+    Default = Config.ManualClashClicksPerBurst,
     Step = 1,
-    Suffix = "ms",
-    Tooltip = "Delay between trigger bot clicks",
+    Suffix = " clicks",
+    Tooltip = "How many clicks to fire per burst in manual clash",
     Callback = function(value)
-        TBSettings.ClickDelay = value
+        Config.ManualClashClicksPerBurst = value
+    end
+})
+
+MainTab:CreateDivider()
+
+-- TRIGGERBOT TOGGLE
+local TriggerbotToggle = MainTab:CreateToggle({
+    Name = "Triggerbot",
+    Default = _G.AutoParryState.TriggerbotMode,
+    Tooltip = "Instantly clicks the moment you are targeted (event-based, 0ms delay). Overrides auto-parry.",
+    Callback = function(value)
+        if Config.AutoParryEnabled then
+            _G.AutoParryState.TriggerbotMode = value
+            _G.AutoParryState.TriggerbotParried = false
+            if value then
+                StartTriggerbot()
+                pcall(function() send_notification("⚡ Triggerbot ON") end)
+            else
+                StopTriggerbot()
+                pcall(function() send_notification("⚡ Triggerbot OFF") end)
+            end
+        end
+    end
+})
+
+local TriggerbotKeybind = MainTab:CreateKeybind({
+    Name = "Triggerbot Keybind",
+    Default = nil,
+    Mode = "toggle",
+    LinkedToggle = TriggerbotToggle,
+    Tooltip = "Toggle new event-based triggerbot on/off",
+    Callback = function(key) end,
+    ActivateCallback = function(active)
+        if Config.AutoParryEnabled then
+            _G.AutoParryState.TriggerbotMode = active
+            _G.AutoParryState.TriggerbotParried = false
+            if active then
+                StartTriggerbot()
+            else
+                StopTriggerbot()
+            end
+        end
+    end
+})
+
+local TriggerbotMultiToggle = MainTab:CreateToggle({
+    Name = "Triggerbot Multi-Click",
+    Default = Config.TriggerbotMultiClick,
+    Tooltip = "Fire multiple clicks per trigger event",
+    Callback = function(value)
+        Config.TriggerbotMultiClick = value
+    end
+})
+
+local TriggerbotCountSlider = MainTab:CreateSlider({
+    Name = "Triggerbot Click Count",
+    Min = 1,
+    Max = 5,
+    Default = Config.TriggerbotClickCount,
+    Step = 1,
+    Suffix = " clicks",
+    Tooltip = "Clicks to fire per trigger (if multi-click enabled)",
+    Callback = function(value)
+        Config.TriggerbotClickCount = value
     end
 })
 
@@ -2223,166 +2499,31 @@ AbilitiesTab:CreateToggle({
     end
 })
 
--- Settings Tab
+-- Settings Tab (compact — detailed settings live in a second window)
 local SettingsTab = Window:CreateTab("Settings")
 
-SettingsTab:CreateLabel({ Text = "OLD Auto-Parry Timing" })
-
-SettingsTab:CreateSlider({
-    Name = "Base Parry Time",
-    Min = 0.1,
-    Max = 1.0,
-    Default = Config.BaseParryTime,
-    Step = 0.01,
-    Suffix = "s",
-    Tooltip = "Base time before parry (OLD)",
-    Callback = function(value)
-        Config.BaseParryTime = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Parry Time Min",
-    Min = 0.05,
-    Max = 0.5,
-    Default = Config.ParryTimeMin,
-    Step = 0.01,
-    Suffix = "s",
-    Tooltip = "Minimum parry time (very fast balls)",
-    Callback = function(value)
-        Config.ParryTimeMin = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Parry Time Max",
-    Min = 0.2,
-    Max = 1.0,
-    Default = Config.ParryTimeMax,
-    Step = 0.01,
-    Suffix = "s",
-    Tooltip = "Maximum parry time (slow balls)",
-    Callback = function(value)
-        Config.ParryTimeMax = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Speed for Min Timing",
-    Min = 200,
-    Max = 800,
-    Default = Config.SpeedForMinTiming,
-    Step = 10,
-    Suffix = " speed",
-    Tooltip = "Speed at which minimum timing is used",
-    Callback = function(value)
-        Config.SpeedForMinTiming = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Speed for Max Timing",
-    Min = 50,
-    Max = 300,
-    Default = Config.SpeedForMaxTiming,
-    Step = 10,
-    Suffix = " speed",
-    Tooltip = "Speed at which maximum timing is used",
-    Callback = function(value)
-        Config.SpeedForMaxTiming = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Emergency Distance",
-    Min = 5,
-    Max = 30,
-    Default = Config.EmergencyDistance,
-    Step = 1,
-    Suffix = " studs",
-    Tooltip = "OLD Emergency parry distance",
-    Callback = function(value)
-        Config.EmergencyDistance = value
-    end
-})
-
-SettingsTab:CreateDivider()
-
-SettingsTab:CreateLabel({ Text = "OLD Clash System" })
+SettingsTab:CreateLabel({ Text = "Curve Detection" })
 
 SettingsTab:CreateToggle({
-    Name = "Enable Auto-Clash",
-    Default = Config.AutoClashEnabled,
-    Tooltip = "OLD Clash system with spam thread",
+    Name = "Enable Curve Detection",
+    Default = Config.EnableCurveDetection,
+    Tooltip = "Uses angular direction history to detect curved balls and adjust parry timing.",
     Callback = function(value)
-        Config.AutoClashEnabled = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Clash Min Parries",
-    Min = 2,
-    Max = 5,
-    Default = Config.ClashMinParries,
-    Step = 1,
-    Suffix = " parries",
-    Tooltip = "Parries needed to activate clash",
-    Callback = function(value)
-        Config.ClashMinParries = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Clash Activation Time",
-    Min = 0.5,
-    Max = 2.0,
-    Default = Config.ClashActivationTime,
-    Step = 0.1,
-    Suffix = "s",
-    Tooltip = "Time window to count parries",
-    Callback = function(value)
-        Config.ClashActivationTime = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Clash Duration",
-    Min = 1.0,
-    Max = 5.0,
-    Default = Config.ClashDeactivationTime,
-    Step = 0.5,
-    Suffix = "s",
-    Tooltip = "How long clash stays active",
-    Callback = function(value)
-        Config.ClashDeactivationTime = value
-    end
-})
-
-SettingsTab:CreateSlider({
-    Name = "Clash Min Speed",
-    Min = 30,
-    Max = 100,
-    Default = Config.ClashMinSpeed,
-    Step = 5,
-    Suffix = " speed",
-    Tooltip = "Minimum speed to count for clash",
-    Callback = function(value)
-        Config.ClashMinSpeed = value
-    end
-})
-
-SettingsTab:CreateDivider()
-
-SettingsTab:CreateToggle({
-    Name = "Show Keybind List",
-    Default = false,
-    Tooltip = "Show floating keybind panel",
-    Callback = function(value)
-        if value then
-            Window:ShowKeybindList()
-        else
-            Window:HideKeybindList()
+        Config.EnableCurveDetection = value
+        if not value then
+            BallTrackingCurve.CurveDetected = false
+            BallTrackingCurve.CurveStrength = 0
+            BallTrackingCurve.DirectionHistory = {}
         end
+    end
+})
+
+SettingsTab:CreateToggle({
+    Name = "Show Curve Indicator",
+    Default = Config.ShowCurveIndicator,
+    Tooltip = "Show curve % and bar above ball in ESP",
+    Callback = function(value)
+        Config.ShowCurveIndicator = value
     end
 })
 
@@ -2402,16 +2543,14 @@ local ProfilesDropdown = SettingsTab:CreateDropdown({
     Name = "Profile",
     Options = GetProfileOptions(),
     Default = "Default",
-    Callback = function(value)
-    end
+    Callback = function(value) end
 })
 
 local ProfileNameInput = SettingsTab:CreateTextInput({
     Name = "Profile Name",
     Default = "MyProfile",
     Placeholder = "Enter name...",
-    Callback = function(text)
-    end
+    Callback = function(text) end
 })
 
 SettingsTab:CreateButton({
@@ -2464,16 +2603,284 @@ SettingsTab:CreateButton({
     end
 })
 
--- ESP (Same as before)
+SettingsTab:CreateDivider()
+
+-- ADVANCED SETTINGS BUTTON → opens second window
+local AdvancedWindow = nil
+local AdvancedWindowOpen = false
+
+SettingsTab:CreateButton({
+    Name = "Advanced Settings...",
+    Tooltip = "Open detailed parry timing, clash, and prediction settings in a separate window",
+    Callback = function()
+        if AdvancedWindowOpen and AdvancedWindow then
+            AdvancedWindow:Toggle()
+            return
+        end
+
+        local advCam = game:GetService("Workspace").CurrentCamera
+        local advSize = advCam and advCam.ViewportSize or Vector2.new(1920, 1080)
+        local advW = 380
+
+        AdvancedWindow = UiLib:CreateWindow({
+            Title = "Advanced Settings",
+            Subtitle = "Parry timing, clash, prediction, triggerbot",
+            Position = Vector2.new((advSize.X - advW) / 2 + 210, (advSize.Y - 500) / 2),
+            Width = advW,
+            ToggleKey = "F4"
+        })
+
+        AdvancedWindow:SetTheme({
+            Accent = Color3.fromRGB(100, 70, 210),
+            On = Color3.fromRGB(0, 255, 180),
+            Off = Color3.fromRGB(255, 60, 85)
+        })
+
+        -- ── PARRY TIMING TAB ──────────────────────────────────────────────
+        local ParryTab = AdvancedWindow:CreateTab("Parry")
+
+        ParryTab:CreateLabel({ Text = "Dynamic Prediction" })
+
+        ParryTab:CreateToggle({
+            Name = "Enable Dynamic Prediction",
+            Default = Config.EnableDynamicPrediction,
+            Tooltip = "Scale parry window based on ball speed",
+            Callback = function(v) Config.EnableDynamicPrediction = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Base Parry Window",
+            Min = 0.10, Max = 0.80, Default = Config.BaseParryWindow, Step = 0.01, Suffix = "s",
+            Tooltip = "Base window (multiplied by speed factor)",
+            Callback = function(v) Config.BaseParryWindow = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Min Parry Window",
+            Min = 0.05, Max = 0.40, Default = Config.MinParryWindow, Step = 0.01, Suffix = "s",
+            Tooltip = "Floor of the parry window",
+            Callback = function(v) Config.MinParryWindow = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Max Prediction Mult",
+            Min = 1.0, Max = 5.0, Default = Config.MaxPredictionMultiplier, Step = 0.1, Suffix = "x",
+            Tooltip = "Max multiplier applied at highest speeds",
+            Callback = function(v) Config.MaxPredictionMultiplier = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Speed Threshold Low",
+            Min = 50, Max = 300, Default = Config.SpeedThresholdLow, Step = 10, Suffix = " speed",
+            Tooltip = "Speed at which prediction starts scaling up",
+            Callback = function(v) Config.SpeedThresholdLow = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Speed Threshold High",
+            Min = 200, Max = 800, Default = Config.SpeedThresholdHigh, Step = 10, Suffix = " speed",
+            Tooltip = "Speed at which max prediction is reached",
+            Callback = function(v) Config.SpeedThresholdHigh = v end
+        })
+
+        ParryTab:CreateDivider()
+        ParryTab:CreateLabel({ Text = "OLD Timing (Fallback)" })
+
+        ParryTab:CreateSlider({
+            Name = "Base Parry Time",
+            Min = 0.1, Max = 1.0, Default = Config.BaseParryTime, Step = 0.01, Suffix = "s",
+            Tooltip = "OLD base parry time (used if dynamic prediction off)",
+            Callback = function(v) Config.BaseParryTime = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Parry Time Min",
+            Min = 0.05, Max = 0.5, Default = Config.ParryTimeMin, Step = 0.01, Suffix = "s",
+            Tooltip = "OLD minimum parry time (fast balls)",
+            Callback = function(v) Config.ParryTimeMin = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Parry Time Max",
+            Min = 0.2, Max = 1.0, Default = Config.ParryTimeMax, Step = 0.01, Suffix = "s",
+            Tooltip = "OLD maximum parry time (slow balls)",
+            Callback = function(v) Config.ParryTimeMax = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Speed → Min Timing",
+            Min = 200, Max = 800, Default = Config.SpeedForMinTiming, Step = 10, Suffix = " speed",
+            Tooltip = "Speed that triggers minimum timing",
+            Callback = function(v) Config.SpeedForMinTiming = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Speed → Max Timing",
+            Min = 50, Max = 300, Default = Config.SpeedForMaxTiming, Step = 10, Suffix = " speed",
+            Tooltip = "Speed that triggers maximum timing",
+            Callback = function(v) Config.SpeedForMaxTiming = v end
+        })
+
+        ParryTab:CreateSlider({
+            Name = "Emergency Distance",
+            Min = 5, Max = 30, Default = Config.EmergencyDistance, Step = 1, Suffix = " studs",
+            Tooltip = "Distance at which emergency parry fires",
+            Callback = function(v) Config.EmergencyDistance = v end
+        })
+
+        -- ── CURVE TAB ─────────────────────────────────────────────────────
+        local CurveTab = AdvancedWindow:CreateTab("Curve")
+
+        CurveTab:CreateLabel({ Text = "Curve Detection Tuning" })
+
+        CurveTab:CreateSlider({
+            Name = "Angle Threshold (°)",
+            Min = 5, Max = 45, Default = Config.CurveAngleThreshold, Step = 1, Suffix = "°",
+            Tooltip = "Avg angle change in degrees to flag a curve. Lower = more sensitive.",
+            Callback = function(v) Config.CurveAngleThreshold = v end
+        })
+
+        CurveTab:CreateSlider({
+            Name = "Check Window (samples)",
+            Min = 2, Max = 6, Default = Config.CurveCheckWindow, Step = 1, Suffix = " samples",
+            Tooltip = "Number of direction samples to average",
+            Callback = function(v) Config.CurveCheckWindow = v end
+        })
+
+        CurveTab:CreateSlider({
+            Name = "Curve Delay Factor",
+            Min = 0.0, Max = 1.0, Default = Config.CurveDelayFactor, Step = 0.05, Suffix = "",
+            Tooltip = "How much to reduce parry mult when curving (0 = no effect, 1 = no parry)",
+            Callback = function(v) Config.CurveDelayFactor = v end
+        })
+
+        CurveTab:CreateSlider({
+            Name = "Min Curve Speed",
+            Min = 50, Max = 400, Default = Config.MinCurveSpeed, Step = 10, Suffix = " speed",
+            Tooltip = "Ball must be at least this fast to check for curves",
+            Callback = function(v) Config.MinCurveSpeed = v end
+        })
+
+        CurveTab:CreateSlider({
+            Name = "Velocity Sample Rate",
+            Min = 0.01, Max = 0.10, Default = Config.VelocitySampleRate, Step = 0.005, Suffix = "s",
+            Tooltip = "How often position is sampled to derive velocity",
+            Callback = function(v) Config.VelocitySampleRate = v end
+        })
+
+        -- ── CLASH TAB ─────────────────────────────────────────────────────
+        local ClashTab = AdvancedWindow:CreateTab("Clash")
+
+        ClashTab:CreateLabel({ Text = "Auto-Clash System" })
+
+        ClashTab:CreateToggle({
+            Name = "Enable Auto-Clash",
+            Default = Config.AutoClashEnabled,
+            Tooltip = "Activates auto-clash spam when rapid parries detected",
+            Callback = function(v) Config.AutoClashEnabled = v end
+        })
+
+        ClashTab:CreateSlider({
+            Name = "Clash Min Parries",
+            Min = 2, Max = 5, Default = Config.ClashMinParries, Step = 1, Suffix = " parries",
+            Tooltip = "Parries needed to activate clash",
+            Callback = function(v) Config.ClashMinParries = v end
+        })
+
+        ClashTab:CreateSlider({
+            Name = "Clash Activation Window",
+            Min = 0.5, Max = 2.0, Default = Config.ClashActivationTime, Step = 0.1, Suffix = "s",
+            Tooltip = "Time window to count parries toward clash",
+            Callback = function(v) Config.ClashActivationTime = v end
+        })
+
+        ClashTab:CreateSlider({
+            Name = "Clash Duration",
+            Min = 1.0, Max = 5.0, Default = Config.ClashDeactivationTime, Step = 0.5, Suffix = "s",
+            Tooltip = "How long clash stays active after last parry",
+            Callback = function(v) Config.ClashDeactivationTime = v end
+        })
+
+        ClashTab:CreateSlider({
+            Name = "Clash Min Speed",
+            Min = 30, Max = 100, Default = Config.ClashMinSpeed, Step = 5, Suffix = " speed",
+            Tooltip = "Minimum ball speed to count toward clash",
+            Callback = function(v) Config.ClashMinSpeed = v end
+        })
+
+        ClashTab:CreateDivider()
+        ClashTab:CreateLabel({ Text = "Manual Clash" })
+
+        ClashTab:CreateSlider({
+            Name = "Clicks Per Burst",
+            Min = 1, Max = 20, Default = Config.ManualClashClicksPerBurst, Step = 1, Suffix = " clicks",
+            Tooltip = "How many clicks per burst in manual clash mode",
+            Callback = function(v) Config.ManualClashClicksPerBurst = v end
+        })
+
+        -- ── TRIGGERBOT TAB ────────────────────────────────────────────────
+        local TrigTab = AdvancedWindow:CreateTab("Triggerbot")
+
+        TrigTab:CreateLabel({ Text = "New Triggerbot" })
+
+        TrigTab:CreateToggle({
+            Name = "Multi-Click",
+            Default = Config.TriggerbotMultiClick,
+            Tooltip = "Fire multiple clicks per trigger event",
+            Callback = function(v) Config.TriggerbotMultiClick = v end
+        })
+
+        TrigTab:CreateSlider({
+            Name = "Click Count",
+            Min = 1, Max = 5, Default = Config.TriggerbotClickCount, Step = 1, Suffix = " clicks",
+            Tooltip = "Clicks to fire per trigger (if multi-click on)",
+            Callback = function(v) Config.TriggerbotClickCount = v end
+        })
+
+        TrigTab:CreateDivider()
+        TrigTab:CreateLabel({ Text = "Legacy Triggerbot" })
+
+        local TBToggle2 = TrigTab:CreateToggle({
+            Name = "Legacy Trigger Bot",
+            Default = TBSettings.Enabled,
+            Tooltip = "Original simple trigger bot (click delay based)",
+            Callback = function(v) TBSettings.Enabled = v end
+        })
+
+        TrigTab:CreateKeybind({
+            Name = "Legacy TB Keybind",
+            Default = TBSettings.Keybind,
+            Mode = "toggle",
+            LinkedToggle = TBToggle2,
+            Tooltip = "Toggle legacy trigger bot",
+            Callback = function(key) TBSettings.Keybind = key end,
+            ActivateCallback = function(active) TBSettings.Enabled = active end
+        })
+
+        TrigTab:CreateSlider({
+            Name = "Legacy TB Click Delay",
+            Min = 10, Max = 200, Default = TBSettings.ClickDelay, Step = 1, Suffix = "ms",
+            Tooltip = "Min delay between legacy TB clicks",
+            Callback = function(v) TBSettings.ClickDelay = v end
+        })
+
+        AdvancedWindowOpen = true
+    end
+})
+
+-- ESP
+local playerPos = nil -- forward declare for ESP use
+
 RunService.Render:Connect(function()
     pcall(function()
         local camera = workspace.CurrentCamera
         if not camera then return end
+
+        playerPos = GetPlayerPosition()
         
         if Config.ShowCurveIndicator then
             local ball = GetCurrentBall()
             if ball then
-                local playerPos = GetPlayerPosition()
                 if playerPos then
                     local distance = math.floor(VectorMagnitude(ball.Position - playerPos))
                     local ballVel = _G.GetBallVelocity(ball)
@@ -2496,11 +2903,17 @@ RunService.Render:Connect(function()
                                 end
                             end
                             
-                            if _G.AutoParryState.ClashMode and Config.AutoClashEnabled then
+                            if _G.AutoParryState.ManualClashMode then
+                                distColor = Color3.fromRGB(255, 100, 255)
+                                distanceText = string.format("⚡ MANUAL CLASH | %d studs", distance)
+                            elseif _G.AutoParryState.TriggerbotMode then
+                                distColor = Color3.fromRGB(255, 50, 50)
+                                distanceText = string.format("🎯 TRIGGERBOT | %d studs", distance)
+                            elseif _G.AutoParryState.ClashMode and Config.AutoClashEnabled then
                                 local timeSinceLastParry = now - _G.AutoParryState.LastClashParryTime
                                 local timeLeft = Config.ClashDeactivationTime - timeSinceLastParry
                                 distColor = Color3.fromRGB(255, 0, 255)
-                                distanceText = string.format("⚡ CLASH ACTIVE [%.1fs]", math.max(0, timeLeft))
+                                distanceText = string.format("⚔️ CLASH ACTIVE [%.1fs]", math.max(0, timeLeft))
                             elseif recentParries > 0 then
                                 distColor = Color3.fromRGB(255, 165, 0)
                                 distanceText = string.format("%d studs | %d/%d parries", distance, recentParries, Config.ClashMinParries)
@@ -2526,47 +2939,39 @@ RunService.Render:Connect(function()
                             yOffset = yOffset + 20
                         end
                         
-                        if CurveState.lastDisplayLevel ~= "None" then
-                            local color = CurveColors[CurveState.lastDisplayLevel]
-                            local text = "CURVE: " .. CurveState.lastDisplayLevel
-                            
-                            DrawingImmediate.OutlinedText(
-                                vector.create(screenPos.X, screenPos.Y + yOffset),
-                                16,
-                                color,
-                                1,
-                                text,
-                                true,
-                                nil
-                            )
-                            
-                            local barWidth = 100
-                            local barHeight = 6
-                            local fillWidth = barWidth * math.min(1, CurveState.lastDisplayIntensity / 0.6)
-                            
-                            DrawingImmediate.FilledRect(
-                                vector.create(screenPos.X - barWidth/2, screenPos.Y + yOffset + 15),
-                                vector.create(barWidth, barHeight),
-                                Color3.fromRGB(50, 50, 50),
-                                0.7
-                            )
-                            
-                            DrawingImmediate.FilledRect(
-                                vector.create(screenPos.X - barWidth/2, screenPos.Y + yOffset + 15),
-                                vector.create(fillWidth, barHeight),
-                                color,
-                                1
-                            )
-                        else
-                            DrawingImmediate.OutlinedText(
-                                vector.create(screenPos.X, screenPos.Y + yOffset),
-                                16,
-                                Color3.fromRGB(255, 255, 255),
-                                0.7,
-                                "STRAIGHT",
-                                true,
-                                nil
-                            )
+                        -- CURVE INDICATOR (advanced angle-based detection)
+                        if Config.EnableCurveDetection and Config.ShowCurveIndicator then
+                            local curveDetected, curveStrength = DetectCurve()
+                            if curveDetected then
+                                local strengthPct = math.floor(curveStrength * 100)
+                                local curveColor
+                                if curveStrength > 0.66 then
+                                    curveColor = Color3.fromRGB(255, 69, 0)   -- Heavy: red-orange
+                                elseif curveStrength > 0.33 then
+                                    curveColor = Color3.fromRGB(255, 165, 0)  -- Medium: orange
+                                else
+                                    curveColor = Color3.fromRGB(255, 255, 0)  -- Light: yellow
+                                end
+                                local text = string.format("CURVE: %d%%", strengthPct)
+                                DrawingImmediate.OutlinedText(
+                                    vector.create(screenPos.X, screenPos.Y + yOffset),
+                                    16, curveColor, 1, text, true, nil
+                                )
+                                yOffset = yOffset + 18
+                                -- Strength bar
+                                local barW = 100
+                                local barH = 6
+                                DrawingImmediate.FilledRectangle(
+                                    vector.create(screenPos.X - barW/2, screenPos.Y + yOffset),
+                                    vector.create(barW, barH),
+                                    Color3.fromRGB(40, 40, 40), 0.7
+                                )
+                                DrawingImmediate.FilledRectangle(
+                                    vector.create(screenPos.X - barW/2, screenPos.Y + yOffset),
+                                    vector.create(barW * curveStrength, barH),
+                                    curveColor, 1
+                                )
+                            end
                         end
                     end
                 end
@@ -2650,8 +3055,8 @@ RunService.Render:Connect(function()
                         if ESPSettings.ShowDistance and playerPos then
                             local hrp = character:FindFirstChild("HumanoidRootPart")
                             if hrp then
-                                local distance = math.floor(VectorMagnitude(hrp.Position - playerPos))
-                                local distText = distance .. " studs"
+                                local dist = math.floor(VectorMagnitude(hrp.Position - playerPos))
+                                local distText = dist .. " studs"
                                 
                                 DrawingImmediate.OutlinedText(
                                     vector.create(screenPos.X, screenPos.Y - 5),
@@ -2671,4 +3076,4 @@ RunService.Render:Connect(function()
     end)
 end)
 
-Window:Notify("Who's AP?", 3)
+Window:Notify("Who's AP?", 5)
