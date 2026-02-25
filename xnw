@@ -2208,8 +2208,8 @@ local centerX = (screenSize.X - menuWidth) / 2
 local centerY = (screenSize.Y - menuHeight) / 2
 
 local Window = UiLib:CreateWindow({
-    Title = "Who's AP? (INTEGRATED)                                                w6lv (UI By X)",
-    Subtitle = "F3 to toggle - Old AP + Old Clash + Manual Clash + Triggerbot",
+    Title = "Who's AP?                                                          w6lv (UI By X)",
+    Subtitle = "F3 to toggle",
     Position = Vector2.new(centerX, centerY),
     Width = menuWidth,
     ToggleKey = "F3"
@@ -3077,3 +3077,4 @@ RunService.Render:Connect(function()
 end)
 
 Window:Notify("Who's AP?", 5)
+
