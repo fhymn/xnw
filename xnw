@@ -55,7 +55,7 @@ local Config = {
     -- OLD AUTO-PARRY TIMING (from old script)
     ParryCooldown = 0.15,
     BaseParryTime = 0.5,  -- Base parry time for normal speeds
-    ParryBufferDistance = 8,
+    ParryBufferDistance = 3,
     MinParrySpeed = 80,  -- Ball must be at least this fast before normal parry fires
     
     -- OLD DYNAMIC PARRY TIMING (parry earlier at higher speeds)
@@ -187,11 +187,11 @@ local Config = {
     -- ADVANCED PREDICTION (from reference script)
     -- ==========================================
     EnableDynamicPrediction = true,
-    BaseParryWindow = 0.35,
-    MinParryWindow = 0.15,
+    BaseParryWindow = 0.45,
+    MinParryWindow = 0.30,
     SpeedThresholdLow = 100,
     SpeedThresholdHigh = 400,
-    MaxPredictionMultiplier = 3.3,
+    MaxPredictionMultiplier = 3.8,
     PredictionCurve = 1.1,
 
     -- OLD CLASH SYSTEM (REDESIGNED - from old script)
@@ -1374,151 +1374,92 @@ end
 -- ==========================================
 
 -- ==========================================
--- AUTO CURVE STATE
--- QueuedDir is picked BEFORE targeting starts.
--- It stays locked until we stop being targeted, then a new one is picked.
--- This means every targeting session uses one consistent direction.
+-- AUTO CURVE
+-- Direction is chosen AT parry time using the ball's live velocity vector.
+-- We dot the ball velocity against the camera's right vector to find
+-- which side the ball is coming from, then flick AWAY from that side.
+-- In "random" mode we also randomly choose up or back instead.
+-- No pre-picking, no state caching — fully reactive every parry.
+-- ==========================================
+
+-- ==========================================
+-- AUTO CURVE
+-- Uses mousemoverel to flick the mouse sideways before clicking,
+-- then moves it back. Taken from BB_sev script — no camera touching.
+-- Direction cycles through a shuffled deck so every direction appears
+-- before any repeats: left, right, back-left, back-right, up.
 -- ==========================================
 
 local AutoCurveState = {
-    IsFlicking = false,
+    IsFlicking  = false,
     WasTargeted = false,
-    QueuedDir = nil,
-    RecentLabels = {},  -- last 2 direction labels, used to avoid same-side repeats
+    QueuedOffset = nil,  -- { x, y } relative mouse offset for next parry
 }
 
--- Direction pools
-local function GetAutoCurvePool(base)
+-- Deck of offsets — shuffled so no direction repeats before full cycle
+-- x > 0 = right, x < 0 = left, large |x| = backward spin
+-- y = 0 for horizontal flicks (up not really possible via mouse alone)
+local CurveDeck = {}
+local CurveDeckIndex = 0
+
+local function GetCurveOffsets()
+    local x = Config.AutoCurveFlickAngle * 36  -- scale degrees → pixels (~36px per degree)
     if Config.AutoCurveMode == "strict" then
-        -- Perfectly balanced: 2 left, 2 right
         return {
-            { "left",        -(base),        0 },
-            { "right",        (base),        0 },
-            { "sharp-left",  -(base * 1.4),  0 },
-            { "sharp-right",  (base * 1.4),  0 },
+            {  x,   0 },  -- right
+            { -x,   0 },  -- left
         }
     else
-        -- Perfectly balanced: 2 left, 2 right, 2 up-diagonal, 1 pure up = 7
-        -- Left and right entries are equal count so no directional bias.
         return {
-            { "left",        -(base),        0  },
-            { "right",        (base),        0  },
-            { "sharp-left",  -(base * 1.5),  0  },
-            { "sharp-right",  (base * 1.5),  0  },
-            { "up-left",     -(base * 0.6),  22  },
-            { "up-right",     (base * 0.6),  22  },
-            { "up",           0,             25  },
+            {  x,   0 },      -- right
+            { -x,   0 },      -- left
+            {  x*2, 0 },      -- back-right (big flick)
+            { -x*2, 0 },      -- back-left  (big flick)
         }
     end
 end
 
--- Pick a new direction, avoiding the last 2 used labels so we never
--- get the same side twice in a row (e.g. left → sharp-left → left).
-local function PickNextCurveDir()
-    local pool = GetAutoCurvePool(Config.AutoCurveFlickAngle)
-    if #pool == 1 then
-        AutoCurveState.QueuedDir = pool[1]
-        return
-    end
-
-    -- Build a list of candidates that don't share a "side" with recent picks.
-    -- Side: anything containing "left" is "L", "right" is "R", "up" alone is "U".
-    local function getSide(label)
-        if label:find("right") then return "R"
-        elseif label:find("left") then return "L"
-        else return "U" end
-    end
-
-    -- Collect sides used in last 2 picks
-    local recentSides = {}
-    for _, lbl in ipairs(AutoCurveState.RecentLabels) do
-        recentSides[getSide(lbl)] = true
-    end
-
-    -- Filter to candidates on a different side
-    local candidates = {}
-    for i, dir in ipairs(pool) do
-        if not recentSides[getSide(dir[1])] then
-            table.insert(candidates, i)
-        end
-    end
-
-    -- Fallback: if all sides are recent (pool is tiny), use full pool
-    if #candidates == 0 then
-        candidates = {}
-        for i = 1, #pool do table.insert(candidates, i) end
-    end
-
-    local pick = candidates[math.random(1, #candidates)]
-    AutoCurveState.QueuedDir = pool[pick]
-
-    -- Track last 2 labels
-    table.insert(AutoCurveState.RecentLabels, pool[pick][1])
-    if #AutoCurveState.RecentLabels > 2 then
-        table.remove(AutoCurveState.RecentLabels, 1)
+local function ShuffleDeck(t)
+    for i = #t, 2, -1 do
+        local j = math.random(1, i)
+        t[i], t[j] = t[j], t[i]
     end
 end
 
--- Call once at startup so first targeting session already has a direction
-PickNextCurveDir()
-
--- Helper: build a CFrame rotated by yawDeg and pitchDeg from originalCF
-local function BuildFlickedCFrame(originalCF, yawDeg, pitchDeg)
-    local look  = originalCF.LookVector
-    local up    = originalCF.UpVector
-    local right = originalCF.RightVector
-
-    local cy, sy = math.cos(math.rad(yawDeg)), math.sin(math.rad(yawDeg))
-    local yawedLookX  =  look.X  * cy + look.Z  * sy
-    local yawedLookZ  = -look.X  * sy + look.Z  * cy
-    local yawedRightX =  right.X * cy + right.Z * sy
-    local yawedRightZ = -right.X * sy + right.Z * cy
-    local yawedLook  = vector.create(yawedLookX,  look.Y,  yawedLookZ)
-    local yawedRight = vector.create(yawedRightX, right.Y, yawedRightZ)
-
-    local cp, sp = math.cos(math.rad(pitchDeg)), math.sin(math.rad(pitchDeg))
-    local fLX = yawedLook.X * cp + up.X * sp
-    local fLY = yawedLook.Y * cp + up.Y * sp
-    local fLZ = yawedLook.Z * cp + up.Z * sp
-    local fUX = -yawedLook.X * sp + up.X * cp
-    local fUY = -yawedLook.Y * sp + up.Y * cp
-    local fUZ = -yawedLook.Z * sp + up.Z * cp
-
-    return CFrame.fromMatrix(
-        originalCF.Position,
-        yawedRight,
-        vector.create(fUX, fUY, fUZ),
-        vector.create(-fLX, -fLY, -fLZ)
-    )
+local function RebuildCurveDeck()
+    local offsets = GetCurveOffsets()
+    CurveDeck = {}
+    for i = 1, #offsets do table.insert(CurveDeck, offsets[i]) end
+    ShuffleDeck(CurveDeck)
+    CurveDeckIndex = 1
 end
 
--- Fires the pre-queued flick direction, then snaps back.
--- Does NOT pick a new direction — that happens when targeting ends.
+local function DealNextCurveOffset()
+    if CurveDeckIndex > #CurveDeck then
+        RebuildCurveDeck()
+    end
+    AutoCurveState.QueuedOffset = CurveDeck[CurveDeckIndex]
+    CurveDeckIndex = CurveDeckIndex + 1
+end
+
+-- Build deck and deal first offset at startup
+RebuildCurveDeck()
+DealNextCurveOffset()
+
 local function DoAutoCurveFlick()
     if not Config.AutoCurveEnabled then return end
     if AutoCurveState.IsFlicking then return end
-    if not AutoCurveState.QueuedDir then return end
+    if not AutoCurveState.QueuedOffset then return end
 
-    local camera = workspace.CurrentCamera
-    if not camera then return end
+    local ox = AutoCurveState.QueuedOffset[1] + math.random(-20, 20)
+    local oy = AutoCurveState.QueuedOffset[2]
 
     AutoCurveState.IsFlicking = true
-
     task.spawn(function()
-        pcall(function()
-            local originalCF = camera.CFrame
-            local dir = AutoCurveState.QueuedDir
-
-            -- Small jitter so repeated flicks in same direction aren't identical
-            local yawDeg   = dir[2] + math.random(-6, 6)
-            local pitchDeg = dir[3] + math.random(-3, 3)
-
-            local flickedCF = BuildFlickedCFrame(originalCF, yawDeg, pitchDeg)
-            camera.CFrame = flickedCF
-            mouse1click()
-            task.wait(Config.AutoCurveFlickDuration)
-            camera.CFrame = originalCF
-        end)
+        mousemoverel(ox, oy)
+        task.wait(0.001)
+        mouse1click()
+        mousemoverel(-ox, -oy)
         AutoCurveState.IsFlicking = false
     end)
 end
@@ -1557,8 +1498,9 @@ RunService.PreLocal:Connect(function()
 
             -- Auto Curve: when targeting ends, pre-pick the next direction
             -- so it is ready before the next targeting session begins.
+            -- Auto Curve: deal next direction when targeting ends
             if Config.AutoCurveEnabled and AutoCurveState.WasTargeted then
-                PickNextCurveDir()
+                DealNextCurveOffset()
             end
         end
 
@@ -2430,7 +2372,7 @@ MainTab:CreateDropdown({
     Callback = function(value)
         Config.AutoCurveMode = value
         -- Reset last direction index so strict mode starts fresh
-        PickNextCurveDir()  -- re-pick when mode changes
+        RebuildCurveDeck(); DealNextCurveOffset()  -- reset deck on mode change
     end
 })
 
