@@ -2,7 +2,7 @@
 
 -- Who's AP? w6lv (UI By X) - INTEGRATED VERSION
 -- Old auto-parry logic + Old clash system + New features
--- + Manual Clash + Triggerbot + Advanced Curve Detection
+-- + Manual Clash + Triggerbot + Advanced Curve Detection + Auto Curve
 
 local function VectorMagnitude(v)
     return math.sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z)
@@ -37,6 +37,7 @@ local MIN = math.min
 local Keybinds = {
     ToggleAutoParry = nil,
     ToggleAutoclicker = nil,
+    ToggleManualClash = nil,
 }
 
 -- AUTOCLICKER SETTINGS
@@ -55,7 +56,7 @@ local Config = {
     ParryCooldown = 0.15,
     BaseParryTime = 0.5,  -- Base parry time for normal speeds
     ParryBufferDistance = 8,
-    MinParrySpeed = 10,
+    MinParrySpeed = 80,  -- Ball must be at least this fast before normal parry fires
     
     -- OLD DYNAMIC PARRY TIMING (parry earlier at higher speeds)
     DynamicParryTiming = true,
@@ -216,7 +217,17 @@ local Config = {
     TriggerbotClickDelay = 0.0005,
 
     PanicParryEnabled = true,
-    PanicParryDistance = 20,
+    PanicParryDistance = 15,  -- Panic parry fires at this distance regardless of speed
+
+    -- ==========================================
+    -- AUTO CURVE
+    -- On parry: flick camera briefly then click, curving the ball
+    -- ==========================================
+    AutoCurveEnabled = false,
+    AutoCurveFlickAngle = 45,       -- Degrees to flick camera sideways
+    AutoCurveFlickDuration = 0.08,  -- How long (seconds) camera stays flicked before snapping back
+    AutoCurveDirection = "random",  -- "left", "right", or "random"
+    AutoCurveMode = "random",       -- "random" (left/right/backward) or "strict" (only left/right)
 }
 
 local TBSettings = {
@@ -240,6 +251,7 @@ _G.AutoParryState = {
     LocalPlayer = game:GetService("Players").LocalPlayer,
     Clicked = false,
     AutoclickerMode = false,
+    ManualClashMode = false,  -- MOVED: now a proper top-level toggle like AutoclickerMode
     CachedCharacter = nil,
     CachedHRP = nil,
     CachedPlayerModel = nil,
@@ -250,7 +262,7 @@ _G.AutoParryState = {
     LastPingUpdate = 0,
     
     -- MANUAL CLASH STATE
-    ManualClashMode = false,
+    -- (ManualClashMode moved to top-level above)
     
     -- TRIGGERBOT STATE
     TriggerbotMode = false,
@@ -457,11 +469,8 @@ end
 
 -- ==========================================
 -- ADVANCED CURVE DETECTION (from reference script)
--- Uses direction history and angular change — proven reliable approach.
--- Integrates into the parry window multiplier rather than adding raw delays.
 -- ==========================================
 
--- Shared BallTracking for curve + velocity (mirrors reference script's BallTracking table)
 local BallTrackingCurve = {
     LastPosition = nil,
     LastPositionTime = 0,
@@ -495,7 +504,6 @@ local function AngleBetweenDirs(v1, v2)
     return 0
 end
 
--- Call this every frame with the current ball to keep direction history updated
 local function UpdateBallVelocityAndCurve(ball)
     if not ball then return {X=0,Y=0,Z=0} end
     local currentTime = tick()
@@ -537,14 +545,12 @@ local function UpdateBallVelocityAndCurve(ball)
     return BallTrackingCurve.CurrentVelocity
 end
 
--- Returns: curveDetected (bool), curveStrength (0-1)
 local function DetectCurve()
     if not Config.EnableCurveDetection then
         return false, 0
     end
 
     local now = tick()
-    -- Cache result for 50ms so we don't spam recalculation
     if now - BallTrackingCurve.LastCurveCheck < 0.05 then
         return BallTrackingCurve.CurveDetected, BallTrackingCurve.CurveStrength
     end
@@ -582,7 +588,6 @@ local function DetectCurve()
     return detected, strength
 end
 
--- Returns the prediction multiplier for parry window (with curve compensation baked in)
 local function CalculatePredictionMultiplier(speed, distance)
     if not Config.EnableDynamicPrediction then return 1.0 end
 
@@ -598,7 +603,6 @@ local function CalculatePredictionMultiplier(speed, distance)
         mult = 1.0 + (Config.MaxPredictionMultiplier - 1.0) * factor
     end
 
-    -- Curve compensation: if curving, reduce multiplier so we wait a touch longer
     if speed > Config.MinCurveSpeed then
         local curveDetected, curveStrength = DetectCurve()
         if curveDetected then
@@ -609,7 +613,6 @@ local function CalculatePredictionMultiplier(speed, distance)
     return mult
 end
 
--- Returns the full dynamic parry window (seconds)
 local function GetDynamicParryWindow(speed, distance)
     local mult = CalculatePredictionMultiplier(speed, distance)
     local window = Config.BaseParryWindow * mult
@@ -1363,6 +1366,163 @@ local function UseAbility(abilityName, cooldownDuration)
     return true
 end
 
+-- ==========================================
+-- AUTO CURVE SYSTEM
+-- Flicks the camera sideways just before the parry click fires,
+-- then snaps it back. This causes the ball to travel in a curved
+-- path, throwing off the opponent.
+-- ==========================================
+
+-- ==========================================
+-- AUTO CURVE STATE
+-- QueuedDir is picked BEFORE targeting starts.
+-- It stays locked until we stop being targeted, then a new one is picked.
+-- This means every targeting session uses one consistent direction.
+-- ==========================================
+
+local AutoCurveState = {
+    IsFlicking = false,
+    WasTargeted = false,
+    QueuedDir = nil,
+    RecentLabels = {},  -- last 2 direction labels, used to avoid same-side repeats
+}
+
+-- Direction pools
+local function GetAutoCurvePool(base)
+    if Config.AutoCurveMode == "strict" then
+        -- Perfectly balanced: 2 left, 2 right
+        return {
+            { "left",        -(base),        0 },
+            { "right",        (base),        0 },
+            { "sharp-left",  -(base * 1.4),  0 },
+            { "sharp-right",  (base * 1.4),  0 },
+        }
+    else
+        -- Perfectly balanced: 2 left, 2 right, 2 up-diagonal, 1 pure up = 7
+        -- Left and right entries are equal count so no directional bias.
+        return {
+            { "left",        -(base),        0  },
+            { "right",        (base),        0  },
+            { "sharp-left",  -(base * 1.5),  0  },
+            { "sharp-right",  (base * 1.5),  0  },
+            { "up-left",     -(base * 0.6),  22  },
+            { "up-right",     (base * 0.6),  22  },
+            { "up",           0,             25  },
+        }
+    end
+end
+
+-- Pick a new direction, avoiding the last 2 used labels so we never
+-- get the same side twice in a row (e.g. left → sharp-left → left).
+local function PickNextCurveDir()
+    local pool = GetAutoCurvePool(Config.AutoCurveFlickAngle)
+    if #pool == 1 then
+        AutoCurveState.QueuedDir = pool[1]
+        return
+    end
+
+    -- Build a list of candidates that don't share a "side" with recent picks.
+    -- Side: anything containing "left" is "L", "right" is "R", "up" alone is "U".
+    local function getSide(label)
+        if label:find("right") then return "R"
+        elseif label:find("left") then return "L"
+        else return "U" end
+    end
+
+    -- Collect sides used in last 2 picks
+    local recentSides = {}
+    for _, lbl in ipairs(AutoCurveState.RecentLabels) do
+        recentSides[getSide(lbl)] = true
+    end
+
+    -- Filter to candidates on a different side
+    local candidates = {}
+    for i, dir in ipairs(pool) do
+        if not recentSides[getSide(dir[1])] then
+            table.insert(candidates, i)
+        end
+    end
+
+    -- Fallback: if all sides are recent (pool is tiny), use full pool
+    if #candidates == 0 then
+        candidates = {}
+        for i = 1, #pool do table.insert(candidates, i) end
+    end
+
+    local pick = candidates[math.random(1, #candidates)]
+    AutoCurveState.QueuedDir = pool[pick]
+
+    -- Track last 2 labels
+    table.insert(AutoCurveState.RecentLabels, pool[pick][1])
+    if #AutoCurveState.RecentLabels > 2 then
+        table.remove(AutoCurveState.RecentLabels, 1)
+    end
+end
+
+-- Call once at startup so first targeting session already has a direction
+PickNextCurveDir()
+
+-- Helper: build a CFrame rotated by yawDeg and pitchDeg from originalCF
+local function BuildFlickedCFrame(originalCF, yawDeg, pitchDeg)
+    local look  = originalCF.LookVector
+    local up    = originalCF.UpVector
+    local right = originalCF.RightVector
+
+    local cy, sy = math.cos(math.rad(yawDeg)), math.sin(math.rad(yawDeg))
+    local yawedLookX  =  look.X  * cy + look.Z  * sy
+    local yawedLookZ  = -look.X  * sy + look.Z  * cy
+    local yawedRightX =  right.X * cy + right.Z * sy
+    local yawedRightZ = -right.X * sy + right.Z * cy
+    local yawedLook  = vector.create(yawedLookX,  look.Y,  yawedLookZ)
+    local yawedRight = vector.create(yawedRightX, right.Y, yawedRightZ)
+
+    local cp, sp = math.cos(math.rad(pitchDeg)), math.sin(math.rad(pitchDeg))
+    local fLX = yawedLook.X * cp + up.X * sp
+    local fLY = yawedLook.Y * cp + up.Y * sp
+    local fLZ = yawedLook.Z * cp + up.Z * sp
+    local fUX = -yawedLook.X * sp + up.X * cp
+    local fUY = -yawedLook.Y * sp + up.Y * cp
+    local fUZ = -yawedLook.Z * sp + up.Z * cp
+
+    return CFrame.fromMatrix(
+        originalCF.Position,
+        yawedRight,
+        vector.create(fUX, fUY, fUZ),
+        vector.create(-fLX, -fLY, -fLZ)
+    )
+end
+
+-- Fires the pre-queued flick direction, then snaps back.
+-- Does NOT pick a new direction — that happens when targeting ends.
+local function DoAutoCurveFlick()
+    if not Config.AutoCurveEnabled then return end
+    if AutoCurveState.IsFlicking then return end
+    if not AutoCurveState.QueuedDir then return end
+
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+
+    AutoCurveState.IsFlicking = true
+
+    task.spawn(function()
+        pcall(function()
+            local originalCF = camera.CFrame
+            local dir = AutoCurveState.QueuedDir
+
+            -- Small jitter so repeated flicks in same direction aren't identical
+            local yawDeg   = dir[2] + math.random(-6, 6)
+            local pitchDeg = dir[3] + math.random(-3, 3)
+
+            local flickedCF = BuildFlickedCFrame(originalCF, yawDeg, pitchDeg)
+            camera.CFrame = flickedCF
+            mouse1click()
+            task.wait(Config.AutoCurveFlickDuration)
+            camera.CFrame = originalCF
+        end)
+        AutoCurveState.IsFlicking = false
+    end)
+end
+
 -- CACHE UPDATES
 RunService.PreLocal:Connect(function()
     if not _G.AutoParryState.ThreadRunning then return end
@@ -1394,7 +1554,15 @@ RunService.PreLocal:Connect(function()
         
         if not isTargeted then
             _G.AutoParryState.Clicked = false
+
+            -- Auto Curve: when targeting ends, pre-pick the next direction
+            -- so it is ready before the next targeting session begins.
+            if Config.AutoCurveEnabled and AutoCurveState.WasTargeted then
+                PickNextCurveDir()
+            end
         end
+
+        AutoCurveState.WasTargeted = isTargeted
         
         if isTargeted and _G.AutoParryState.AbilityTracking.BallFrozen then
             if _G.AutoParryState.Clicked then
@@ -1446,7 +1614,6 @@ end)
 
 -- ==========================================
 -- NEW TRIGGERBOT SYSTEM (from reference script)
--- Event-based (instant) + loop fallback
 -- ==========================================
 
 local TriggerbotEventConnection = nil
@@ -1466,13 +1633,11 @@ local function TriggerbotDoClick()
 end
 
 local function StartTriggerbot()
-    -- Disconnect any existing connection
     if TriggerbotEventConnection then
         pcall(function() TriggerbotEventConnection:Disconnect() end)
         TriggerbotEventConnection = nil
     end
 
-    -- METHOD 1: Event-based (fires the instant highlight is added — 0ms delay)
     local function SetupEventDetection()
         pcall(function()
             local playerModel = _G.AutoParryState.CachedPlayerModel
@@ -1508,7 +1673,6 @@ local function StartTriggerbot()
 
     SetupEventDetection()
 
-    -- METHOD 2: Loop fallback (~1ms response, catches anything the event misses)
     task.spawn(function()
         local highlightDetected = false
 
@@ -1523,7 +1687,6 @@ local function StartTriggerbot()
                 local now = tick()
                 local playerModel = _G.AutoParryState.CachedPlayerModel
 
-                -- Re-establish event if player model refreshed
                 if playerModel and not TriggerbotEventConnection then
                     SetupEventDetection()
                 end
@@ -1630,7 +1793,6 @@ RunService.PreLocal:Connect(function()
             _G.AutoParryState.BallData.lastBallPosition = nil
             _G.AutoParryState.BallData.approachVelocity = 0
             _G.AutoParryState.BallTracking.peakSpeed = 0
-            -- Reset curve state when no ball
             BallTrackingCurve.LastPosition = nil
             BallTrackingCurve.VelocityHistory = {}
             BallTrackingCurve.DirectionHistory = {}
@@ -1651,9 +1813,6 @@ RunService.PreLocal:Connect(function()
             BallTrackingCurve.DirectionHistory = {}
             BallTrackingCurve.CurveDetected = false
             BallTrackingCurve.CurveStrength = 0
-            -- Always kill clash mode on ball respawn — previous round's
-            -- LastClashParryTime would keep spam running into the new round
-            -- and block normal parrying until the timer expires.
             _G.AutoParryState.ClashMode = false
             _G.AutoParryState.ParryHistory = {}
             _G.AutoParryState.LastClashParryTime = 0
@@ -1713,7 +1872,6 @@ RunService.PreLocal:Connect(function()
             
             _G.AutoParryState.BallData.lastBallPosition = ballPos
 
-            -- ADVANCED CURVE DETECTION (reference script approach)
             if Config.EnableCurveDetection then
                 UpdateBallVelocityAndCurve(Ball)
             end
@@ -1763,7 +1921,6 @@ local function RecordParry(speed)
         speed = speed
     })
     
-    -- Clean up old parries
     local cutoffTime = now - Config.ClashActivationTime
     for i = #_G.AutoParryState.ParryHistory, 1, -1 do
         if _G.AutoParryState.ParryHistory[i].time < cutoffTime then
@@ -1771,7 +1928,6 @@ local function RecordParry(speed)
         end
     end
     
-    -- Update last clash parry time if in clash mode
     if _G.AutoParryState.ClashMode then
         _G.AutoParryState.LastClashParryTime = now
     end
@@ -1780,7 +1936,6 @@ end
 local function CheckClashActivation()
     local now = tick()
     
-    -- Count recent parries
     local recentParries = 0
     local cutoffTime = now - Config.ClashActivationTime
     
@@ -1790,7 +1945,6 @@ local function CheckClashActivation()
         end
     end
     
-    -- Activate clash mode
     if not _G.AutoParryState.ClashMode and recentParries >= Config.ClashMinParries then
         _G.AutoParryState.ClashMode = true
         _G.AutoParryState.ClashModeActivatedAt = now
@@ -1802,7 +1956,6 @@ local function CheckClashActivation()
         return true
     end
     
-    -- Deactivate if no recent parries
     if _G.AutoParryState.ClashMode then
         local timeSinceLastParry = now - _G.AutoParryState.LastClashParryTime
         
@@ -1819,16 +1972,13 @@ local function CheckClashActivation()
     return _G.AutoParryState.ClashMode
 end
 
--- OLD DYNAMIC PARRY TIME FUNCTION (from old script)
 local function GetParryTime(speed)
     if not Config.DynamicParryTiming then
         return Config.BaseParryTime
     end
     
-    -- Clamp speed to range
     local clampedSpeed = math.max(Config.SpeedForMaxTiming, math.min(Config.SpeedForMinTiming, speed))
     
-    -- Linear interpolation between max and min timing
     local speedRange = Config.SpeedForMinTiming - Config.SpeedForMaxTiming
     local timeRange = Config.ParryTimeMax - Config.ParryTimeMin
     local speedOffset = clampedSpeed - Config.SpeedForMaxTiming
@@ -1838,7 +1988,6 @@ local function GetParryTime(speed)
     return parryTime
 end
 
--- OLD EMERGENCY PARRY FUNCTION (from old script)
 local function EmergencyParry(distance, speed)
     if distance <= Config.EmergencyDistance then
         local now = tick()
@@ -1867,21 +2016,15 @@ task.spawn(function()
                 
                 if _G.AutoParryState.ClashMode then
                     local timeSinceLastParry = now - _G.AutoParryState.LastClashParryTime
-                    
-                    -- Also deactivate if the ball just respawned (respawn resets ClashMode,
-                    -- but this is a belt-and-suspenders check)
                     local timeSinceRespawn = now - (_G.AutoParryState.BallData.ballRespawnTime or 0)
                     
                     if timeSinceLastParry > Config.ClashDeactivationTime then
                         _G.AutoParryState.ClashMode = false
                     elseif timeSinceRespawn < 0.4 then
-                        -- Ball just respawned — hold off for 400ms so normal
-                        -- parry logic has priority at the start of the new round
                         return
                     elseif isTargeted and not _G.AutoParryState.AbilityTracking.BallFrozen then
-                        -- Continuous spam clicks
                         mouse1click()
-                        keypress(0x46) -- F key
+                        keypress(0x46)
                         keyrelease(0x46)
                     end
                 end
@@ -1891,8 +2034,8 @@ task.spawn(function()
 end)
 
 -- ==========================================
--- MANUAL CLASH (from reference script)
--- Ultra-fast loop: 10 clicks + F key per burst when targeted
+-- MANUAL CLASH SPAM THREAD
+-- Runs when ManualClashMode is toggled ON (like autoclicker)
 -- ==========================================
 
 task.spawn(function()
@@ -1900,7 +2043,7 @@ task.spawn(function()
 
     while true do
         task.wait(0)
-        if Config.AutoParryEnabled and Config.ManualClashEnabled and _G.AutoParryState.ManualClashMode then
+        if Config.ManualClashEnabled and _G.AutoParryState.ManualClashMode then
             local isTargeted = _G.AutoParryState.BallData.isTargeted
             if isTargeted then
                 local now = tick()
@@ -1919,13 +2062,16 @@ task.spawn(function()
     end
 end)
 
--- INTEGRATED AUTO-PARRY LOGIC (OLD + NEW, with curve delay applied non-destructively)
+-- ==========================================
+-- INTEGRATED AUTO-PARRY LOGIC
+-- Auto Curve: when enabled, the parry click is replaced by DoAutoCurveFlick()
+-- which flicks the camera, clicks, then snaps back.
+-- ==========================================
 RunService.PreLocal:Connect(function()
     if not _G.AutoParryState.ThreadRunning or not Config.AutoParryEnabled or _G.AutoParryState.AutoclickerMode then
         return
     end
 
-    -- Triggerbot and manual clash run independently; skip normal AP logic for them
     if _G.AutoParryState.TriggerbotMode then
         return
     end
@@ -1933,18 +2079,19 @@ RunService.PreLocal:Connect(function()
     pcall(function()
         local currentTime = tick()
         local isTargeted = _G.AutoParryState.BallData.isTargeted
+
+        -- Don't fire on a freshly spawned ball — wait at least 1s after respawn
+        local timeSinceRespawn = currentTime - (_G.AutoParryState.BallData.ballRespawnTime or 0)
+        if timeSinceRespawn < 1.0 then return end
         
-        -- Don't interfere with Slash of Fury
         if _G.AutoParryState.AbilityTracking.SoFActive then
             return
         end
         
-        -- MARTYRDOM SAFETY
         if ShouldAvoidMartyrdom() then
             return
         end
         
-        -- FREEZE ABILITY
         if ShouldParryFrozenBall() then
             local Ball = GetCurrentBall()
             if Ball and not _G.AutoParryState.Clicked then
@@ -1957,27 +2104,22 @@ RunService.PreLocal:Connect(function()
 
         if _G.AutoParryState.AbilityTracking.FreezeJustExpired then
             local timeSinceExpire = currentTime - _G.AutoParryState.AbilityTracking.FreezeExpireTime
-
             if timeSinceExpire > 0.2 then
                 _G.AutoParryState.AbilityTracking.FreezeJustExpired = false
             end
         end
         
-        -- TELEKINESIS
         if ShouldParryTelekinesis() then
             local Ball = GetCurrentBall()
             if Ball and not _G.AutoParryState.Clicked then
                 mouse1click()
                 _G.AutoParryState.Clicked = true
                 _G.AutoParryState.LastParryTime = currentTime
-                
                 _G.AutoParryState.AbilityTracking.TelekinesisActive = false
-                
                 return
             end
         end
         
-        -- AERODYNAMIC SLASH VFX
         if _G.AutoParryState.AbilityTracking.AeroVFXDetected then
             local Ball = GetCurrentBall()
             local playerPos = GetPlayerPosition()
@@ -2001,7 +2143,6 @@ RunService.PreLocal:Connect(function()
             return
         end
         
-        -- Singularity Cape check
         local hasCape = HasSingularityCape()
         if hasCape then
             local Ball = GetCurrentBall()
@@ -2013,7 +2154,6 @@ RunService.PreLocal:Connect(function()
                 if playerPos then
                     local ballPos = Ball.Position
                     local distance = VectorMagnitude(ballPos - playerPos)
-
                     if not (speed > 300 and distance < 100) then
                         return
                     end
@@ -2037,7 +2177,20 @@ RunService.PreLocal:Connect(function()
         local currentSpeed = VectorMagnitude(ballVel)
         local distance = VectorMagnitude(ballPos - playerPos)
         local approachVelocity = _G.AutoParryState.BallData.approachVelocity or 0
-        
+
+        -- PANIC PARRY: if ball is dangerously close, click immediately
+        -- regardless of speed — bypasses MinParrySpeed entirely.
+        if Config.PanicParryEnabled
+            and distance <= Config.PanicParryDistance
+            and not _G.AutoParryState.Clicked
+            and currentTime - _G.AutoParryState.LastParryTime >= Config.EmergencyParryCooldown then
+            mouse1click()
+            _G.AutoParryState.LastParryTime = currentTime
+            _G.AutoParryState.Clicked = true
+            RecordParry(currentSpeed)
+            return
+        end
+
         if currentSpeed <= Config.MinParrySpeed then return end
         
         local speedForMultiplier = _G.AutoParryState.BallTracking.peakSpeed
@@ -2045,30 +2198,24 @@ RunService.PreLocal:Connect(function()
             speedForMultiplier = currentSpeed
         end
         
-        -- CHECK CLASH MODE
         CheckClashActivation()
         
-        -- CLASH MODE SPAM (handled by separate thread, skip normal parry)
         if Config.AutoClashEnabled and _G.AutoParryState.ClashMode and isTargeted and not _G.AutoParryState.Clicked then
-            return -- Let spam thread handle it
+            return
         end
         
-        -- OLD EMERGENCY PARRY (from old script)
         if EmergencyParry(distance, currentSpeed) then
             return
         end
         
-        -- OLD PARRY COOLDOWN CHECK (from old script)
         if currentTime - _G.AutoParryState.LastParryTime < Config.ParryCooldown then
             return
         end
         
-        -- Skip if already clicked
         if _G.AutoParryState.Clicked then
             return
         end
         
-        -- OLD DIRECTION CHECK (from old script)
         if distance > Config.IgnoreDirectionUnderDistance then
             local dirToPlayer_X = (playerPos.X - ballPos.X) / distance
             local dirToPlayer_Y = (playerPos.Y - ballPos.Y) / distance
@@ -2085,14 +2232,11 @@ RunService.PreLocal:Connect(function()
             end
         end
         
-        -- Calculate time to reach (uses new dynamic parry window with curve baked in)
         local adjustedDistance = math.max(0, distance - Config.ParryBufferDistance)
         local timeToReach = adjustedDistance / currentSpeed
         
-        -- Get dynamic parry window (reference script approach — curve compensation integrated)
         local parryTime = GetDynamicParryWindow(currentSpeed, distance)
         
-        -- Parry if within time window
         if timeToReach <= parryTime then
             local equippedAbility = GetEquippedAbility()
             local abilityUsed = false
@@ -2100,7 +2244,6 @@ RunService.PreLocal:Connect(function()
             if equippedAbility then
                 local abilityLower = equippedAbility:lower()
                 
-                -- INFINITY
                 if (abilityLower:find("infinity") or abilityLower:find("inf")) and Config.AutoPopAbilities.Infinity.enabled then
                     if UseAbility("Infinity", 28) then
                         _G.AutoParryState.Clicked = true
@@ -2109,7 +2252,6 @@ RunService.PreLocal:Connect(function()
                     end
                 end
 
-                -- RAGING DEFLECTION
                 if not abilityUsed and abilityLower:find("raging") and Config.AutoPopAbilities.RagingDeflection.enabled then
                     if UseAbility("RagingDeflection", 35) then
                         _G.AutoParryState.Clicked = true
@@ -2118,7 +2260,6 @@ RunService.PreLocal:Connect(function()
                     end
                 end
 
-                -- CALMING DEFLECTION
                 if not abilityUsed and abilityLower:find("calming") and Config.AutoPopAbilities.CalmingDeflection.enabled then
                     if UseAbility("CalmingDeflection", 35) then
                         _G.AutoParryState.Clicked = true
@@ -2127,7 +2268,6 @@ RunService.PreLocal:Connect(function()
                     end
                 end
 
-                -- SINGULARITY
                 if not abilityUsed and (abilityLower:find("singularity") or abilityLower:find("sing")) and Config.AutoPopAbilities.Singularity.enabled then
                     if Config.AutoPopAbilities.Singularity.useOnParry then
                         if UseAbility("Singularity", 24) then
@@ -2138,7 +2278,6 @@ RunService.PreLocal:Connect(function()
                     end
                 end
 
-                -- DEATH SLASH
                 if not abilityUsed and abilityLower:find("death") and Config.AutoPopAbilities.DeathSlash.enabled then
                     if UseAbility("DeathSlash", 13) then
                         _G.AutoParryState.Clicked = true
@@ -2147,7 +2286,6 @@ RunService.PreLocal:Connect(function()
                     end
                 end
 
-                -- AERODYNAMIC SLASH
                 if not abilityUsed and (abilityLower:find("aerodynamic") or abilityLower:find("aero")) and Config.AutoPopAbilities.AerodynamicSlash.enabled then
                     if Config.AutoPopAbilities.AerodynamicSlash.useOnParry then
                         if UseAbility("AerodynamicSlash", 40) then
@@ -2158,7 +2296,6 @@ RunService.PreLocal:Connect(function()
                     end
                 end
 
-                -- RAPTURE
                 if not abilityUsed and abilityLower:find("rapture") and Config.AutoPopAbilities.Rapture.enabled then
                     if Config.AutoPopAbilities.Rapture.useOnParry then
                         if UseAbility("Rapture", 30) then
@@ -2169,7 +2306,6 @@ RunService.PreLocal:Connect(function()
                     end
                 end
 
-                -- SLASH OF FURY
                 if not abilityUsed and (abilityLower:find("fury") or abilityLower:find("slash of fury")) and Config.AutoPopAbilities.SlashOfFury.enabled then
                     if Config.AutoPopAbilities.SlashOfFury.useOnParry then
                         if distance >= Config.AutoPopAbilities.SlashOfFury.activateMinDistance and
@@ -2185,12 +2321,15 @@ RunService.PreLocal:Connect(function()
                 end
             end
 
-            -- Normal parry if no ability used
+            -- Normal parry (or Auto Curve parry) if no ability used
             if not abilityUsed then
-                mouse1click()
+                if Config.AutoCurveEnabled and not AutoCurveState.IsFlicking then
+                    DoAutoCurveFlick()
+                else
+                    mouse1click()
+                end
                 _G.AutoParryState.LastParryTime = currentTime
                 _G.AutoParryState.Clicked = true
-                
                 RecordParry(currentSpeed)
             end
         end
@@ -2230,7 +2369,6 @@ local AutoParryToggle = MainTab:CreateToggle({
     Callback = function(value)
         Config.AutoParryEnabled = value
         if not value then
-            -- Disable manual clash and triggerbot when AP is off
             _G.AutoParryState.ManualClashMode = false
             _G.AutoParryState.TriggerbotMode = false
             StopTriggerbot()
@@ -2254,37 +2392,53 @@ local AutoParryKeybind = MainTab:CreateKeybind({
 
 MainTab:CreateDivider()
 
--- MANUAL CLASH TOGGLE
-local ManualClashToggle = MainTab:CreateToggle({
-    Name = "Manual Clash",
-    Default = _G.AutoParryState.ManualClashMode,
-    Tooltip = "Ultra-fast click + F key spam when targeted. Works alongside auto-parry.",
+-- ==========================================
+-- AUTO CURVE TOGGLE + KEYBIND + MODE DROPDOWN
+-- ==========================================
+local AutoCurveToggle = MainTab:CreateToggle({
+    Name = "Auto Curve",
+    Default = Config.AutoCurveEnabled,
+    Tooltip = "On parry: flicks camera in a random direction to curve the ball and throw off the opponent.",
     Callback = function(value)
-        if Config.AutoParryEnabled then
-            _G.AutoParryState.ManualClashMode = value
-            pcall(function()
-                send_notification("Manual Clash " .. (value and "ON" or "OFF"))
-            end)
-        end
+        Config.AutoCurveEnabled = value
+        pcall(function()
+            send_notification("Auto Curve " .. (value and "ON" or "OFF"))
+        end)
     end
 })
 
-local ManualClashClicksSlider = MainTab:CreateSlider({
-    Name = "Clash Clicks Per Burst",
-    Min = 1,
-    Max = 20,
-    Default = Config.ManualClashClicksPerBurst,
-    Step = 1,
-    Suffix = " clicks",
-    Tooltip = "How many clicks to fire per burst in manual clash",
+MainTab:CreateKeybind({
+    Name = "Auto Curve Keybind",
+    Default = nil,
+    Mode = "toggle",
+    LinkedToggle = AutoCurveToggle,
+    Tooltip = "Keybind to toggle Auto Curve on/off (toggle or hold)",
+    Callback = function(key) end,
+    ActivateCallback = function(active)
+        Config.AutoCurveEnabled = active
+        pcall(function()
+            send_notification("Auto Curve " .. (active and "ON" or "OFF"))
+        end)
+    end
+})
+
+MainTab:CreateDropdown({
+    Name = "Curve Mode",
+    Options = {"random", "strict"},
+    Default = Config.AutoCurveMode,
+    Tooltip = "random = left / right / backward in any order | strict = only left / right alternating",
     Callback = function(value)
-        Config.ManualClashClicksPerBurst = value
+        Config.AutoCurveMode = value
+        -- Reset last direction index so strict mode starts fresh
+        PickNextCurveDir()  -- re-pick when mode changes
     end
 })
 
 MainTab:CreateDivider()
 
--- TRIGGERBOT TOGGLE
+-- ==========================================
+-- TRIGGERBOT SECTION
+-- ==========================================
 local TriggerbotToggle = MainTab:CreateToggle({
     Name = "Triggerbot",
     Default = _G.AutoParryState.TriggerbotMode,
@@ -2348,6 +2502,10 @@ local TriggerbotCountSlider = MainTab:CreateSlider({
 
 MainTab:CreateDivider()
 
+-- ==========================================
+-- AUTOCLICKER + MANUAL CLASH (grouped together)
+-- ==========================================
+
 local AutoclickerToggle = MainTab:CreateToggle({
     Name = "Autoclicker",
     Default = _G.AutoParryState.AutoclickerMode,
@@ -2368,6 +2526,49 @@ local AutoclickerKeybind = MainTab:CreateKeybind({
     end,
     ActivateCallback = function(active)
         _G.AutoParryState.AutoclickerMode = active
+    end
+})
+
+-- MANUAL CLASH — now a proper toggle with keybind, grouped next to autoclicker
+local ManualClashToggle = MainTab:CreateToggle({
+    Name = "Manual Clash",
+    Default = _G.AutoParryState.ManualClashMode,
+    Tooltip = "Ultra-fast click + F key spam when targeted. Works alongside auto-parry.",
+    Callback = function(value)
+        _G.AutoParryState.ManualClashMode = value
+        pcall(function()
+            send_notification("Manual Clash " .. (value and "ON" or "OFF"))
+        end)
+    end
+})
+
+local ManualClashKeybind = MainTab:CreateKeybind({
+    Name = "Manual Clash Keybind",
+    Default = Keybinds.ToggleManualClash,
+    Mode = "toggle",
+    LinkedToggle = ManualClashToggle,
+    Tooltip = "Toggle manual clash on/off",
+    Callback = function(key)
+        Keybinds.ToggleManualClash = key
+    end,
+    ActivateCallback = function(active)
+        _G.AutoParryState.ManualClashMode = active
+        pcall(function()
+            send_notification("Manual Clash " .. (active and "ON" or "OFF"))
+        end)
+    end
+})
+
+local ManualClashClicksSlider = MainTab:CreateSlider({
+    Name = "Clash Clicks Per Burst",
+    Min = 1,
+    Max = 20,
+    Default = Config.ManualClashClicksPerBurst,
+    Step = 1,
+    Suffix = " clicks",
+    Tooltip = "How many clicks to fire per burst in manual clash",
+    Callback = function(value)
+        Config.ManualClashClicksPerBurst = value
     end
 })
 
@@ -2499,7 +2700,7 @@ AbilitiesTab:CreateToggle({
     end
 })
 
--- Settings Tab (compact — detailed settings live in a second window)
+-- Settings Tab
 local SettingsTab = Window:CreateTab("Settings")
 
 SettingsTab:CreateLabel({ Text = "Curve Detection" })
@@ -2605,7 +2806,7 @@ SettingsTab:CreateButton({
 
 SettingsTab:CreateDivider()
 
--- ADVANCED SETTINGS BUTTON → opens second window
+-- ADVANCED SETTINGS BUTTON
 local AdvancedWindow = nil
 local AdvancedWindowOpen = false
 
@@ -2768,6 +2969,31 @@ SettingsTab:CreateButton({
             Callback = function(v) Config.VelocitySampleRate = v end
         })
 
+        CurveTab:CreateDivider()
+        CurveTab:CreateLabel({ Text = "Auto Curve Settings" })
+
+        CurveTab:CreateSlider({
+            Name = "Flick Angle",
+            Min = 10, Max = 90, Default = Config.AutoCurveFlickAngle, Step = 5, Suffix = "°",
+            Tooltip = "How many degrees to flick the camera sideways on parry",
+            Callback = function(v) Config.AutoCurveFlickAngle = v end
+        })
+
+        CurveTab:CreateSlider({
+            Name = "Flick Duration",
+            Min = 0.02, Max = 0.20, Default = Config.AutoCurveFlickDuration, Step = 0.01, Suffix = "s",
+            Tooltip = "How long the camera stays flicked before snapping back",
+            Callback = function(v) Config.AutoCurveFlickDuration = v end
+        })
+
+        CurveTab:CreateDropdown({
+            Name = "Flick Direction",
+            Options = {"random", "left", "right"},
+            Default = Config.AutoCurveDirection,
+            Tooltip = "Which direction to flick: random alternates each parry",
+            Callback = function(v) Config.AutoCurveDirection = v end
+        })
+
         -- ── CLASH TAB ─────────────────────────────────────────────────────
         local ClashTab = AdvancedWindow:CreateTab("Clash")
 
@@ -2869,7 +3095,7 @@ SettingsTab:CreateButton({
 })
 
 -- ESP
-local playerPos = nil -- forward declare for ESP use
+local playerPos = nil
 
 RunService.Render:Connect(function()
     pcall(function()
@@ -2909,6 +3135,9 @@ RunService.Render:Connect(function()
                             elseif _G.AutoParryState.TriggerbotMode then
                                 distColor = Color3.fromRGB(255, 50, 50)
                                 distanceText = string.format("🎯 TRIGGERBOT | %d studs", distance)
+                            elseif Config.AutoCurveEnabled then
+                                distColor = Color3.fromRGB(0, 220, 255)
+                                distanceText = string.format("〜 AUTO CURVE | %d studs", distance)
                             elseif _G.AutoParryState.ClashMode and Config.AutoClashEnabled then
                                 local timeSinceLastParry = now - _G.AutoParryState.LastClashParryTime
                                 local timeLeft = Config.ClashDeactivationTime - timeSinceLastParry
@@ -2939,18 +3168,17 @@ RunService.Render:Connect(function()
                             yOffset = yOffset + 20
                         end
                         
-                        -- CURVE INDICATOR (advanced angle-based detection)
                         if Config.EnableCurveDetection and Config.ShowCurveIndicator then
                             local curveDetected, curveStrength = DetectCurve()
                             if curveDetected then
                                 local strengthPct = math.floor(curveStrength * 100)
                                 local curveColor
                                 if curveStrength > 0.66 then
-                                    curveColor = Color3.fromRGB(255, 69, 0)   -- Heavy: red-orange
+                                    curveColor = Color3.fromRGB(255, 69, 0)
                                 elseif curveStrength > 0.33 then
-                                    curveColor = Color3.fromRGB(255, 165, 0)  -- Medium: orange
+                                    curveColor = Color3.fromRGB(255, 165, 0)
                                 else
-                                    curveColor = Color3.fromRGB(255, 255, 0)  -- Light: yellow
+                                    curveColor = Color3.fromRGB(255, 255, 0)
                                 end
                                 local text = string.format("CURVE: %d%%", strengthPct)
                                 DrawingImmediate.OutlinedText(
@@ -2958,7 +3186,6 @@ RunService.Render:Connect(function()
                                     16, curveColor, 1, text, true, nil
                                 )
                                 yOffset = yOffset + 18
-                                -- Strength bar
                                 local barW = 100
                                 local barH = 6
                                 DrawingImmediate.FilledRectangle(
@@ -3077,4 +3304,3 @@ RunService.Render:Connect(function()
 end)
 
 Window:Notify("Who's AP?", 5)
-
