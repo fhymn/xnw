@@ -1,0 +1,293 @@
+local BUTTON_NAMES = { "Button1", "Button2", "Button3", "Button4", "Button5" }
+local LANE_KEYS    = { 0x41, 0x53, 0x44, 0x46, 0x47 }
+
+local HEAD_OFFSET  = 405
+local HOLD_MIN_H   = 60
+local TAP_HOLD_SEC = 0.07
+local TOUCH_DIST   = 14
+local PAST_CATCH   = 25
+
+local LANE_COLORS = {
+    Color3.fromRGB(210,  70, 255),
+    Color3.fromRGB(255,  60, 130),
+    Color3.fromRGB(  0, 200, 255),
+    Color3.fromRGB( 40, 220,  90),
+    Color3.fromRGB(255, 170,   0),
+}
+local COLOR_ON_LINE = Color3.fromRGB(255, 255, 255)
+local COLOR_HOLD    = Color3.fromRGB(255, 220,  70)
+local LINE_COLOR    = Color3.fromRGB(255, 235,  60)
+local LINE_THICK    = 4
+local CIRCLE_RADIUS = 20
+local CIRCLE_SIDES  = 48
+local CIRCLE_THICK  = 2
+local TAIL_THICK    = 5
+local MAX_CIRCLES   = 12
+
+local function tryGet(fn)
+    local ok, v = pcall(fn)
+    if ok and v ~= nil then return v end
+    return nil
+end
+
+local hitLine = Drawing.new("Line")
+hitLine.Color = LINE_COLOR; hitLine.Thickness = LINE_THICK
+hitLine.Visible = false; hitLine.ZIndex = 5
+
+local circles = {}
+local tails   = {}
+for lane = 1, 5 do
+    circles[lane] = {}
+    tails[lane]   = {}
+    for j = 1, MAX_CIRCLES do
+        local c = Drawing.new("Circle")
+        c.NumSides = CIRCLE_SIDES; c.Radius = CIRCLE_RADIUS
+        c.Thickness = CIRCLE_THICK; c.Filled = false
+        c.Visible = false; c.ZIndex = 10
+        circles[lane][j] = c
+
+        local t = Drawing.new("Line")
+        t.Thickness = TAIL_THICK; t.Visible = false; t.ZIndex = 9
+        tails[lane][j] = t
+    end
+end
+
+local function removeAll()
+    pcall(function() hitLine:Remove() end)
+    for lane = 1, 5 do
+        for j = 1, MAX_CIRCLES do
+            pcall(function() circles[lane][j]:Remove() end)
+            pcall(function() tails[lane][j]:Remove() end)
+        end
+    end
+end
+
+local function hideAllESP()
+    hitLine.Visible = false
+    for lane = 1, 5 do
+        for j = 1, MAX_CIRCLES do
+            circles[lane][j].Visible = false
+            tails[lane][j].Visible   = false
+        end
+    end
+end
+
+local tapping    = {} for i = 1, 5 do tapping[i]    = false end
+local tapRelease = {} for i = 1, 5 do tapRelease[i] = 0     end
+local holding    = {} for i = 1, 5 do holding[i]    = nil   end
+local fired      = {} for i = 1, 5 do fired[i]      = {}    end
+
+local function releaseAllKeys()
+    for i = 1, 5 do
+        keyrelease(LANE_KEYS[i])
+        tapping[i] = false
+        holding[i] = nil
+        fired[i]   = {}
+    end
+end
+
+local conveyors      = nil
+local buttonCentersX = nil
+local hitY           = nil
+local guiActive      = false
+
+local function setupGUI()
+    local pg = tryGet(function() return game:GetService("Players").LocalPlayer.PlayerGui end)
+    if not pg then return false end
+    local gm     = tryGet(function() return pg:FindFirstChild("GuitarMinigame") end)
+    if not gm then return false end
+    local page   = tryGet(function() return gm:FindFirstChild("Page") end)
+    local main   = page and tryGet(function() return page:FindFirstChild("Main") end)
+    local bottom = main and tryGet(function() return main:FindFirstChild("Bottom") end)
+    if not bottom then return false end
+
+    local newConvs = {}
+    local newCX    = {}
+    local newHitY  = nil
+
+    for i = 1, 5 do
+        local btn  = tryGet(function() return bottom:FindFirstChild(BUTTON_NAMES[i]) end)
+        local conv = btn and tryGet(function() return btn:FindFirstChild("Conveyor") end)
+        newConvs[i] = conv
+        local bap = btn and tryGet(function() return btn.AbsolutePosition end)
+        local bas = btn and tryGet(function() return btn.AbsoluteSize end)
+        if bap and bas then
+            newCX[i] = bap.X + bas.X / 2
+            if not newHitY then newHitY = bap.Y + bas.Y / 2 end
+        end
+    end
+
+    if not newHitY then return false end
+    conveyors      = newConvs
+    buttonCentersX = newCX
+    hitY           = newHitY
+    guiActive      = true
+
+    local lx = (newCX[1] or 0) - 50
+    local rx = (newCX[5] or 0) + 50
+    hitLine.From    = Vector2.new(lx, newHitY)
+    hitLine.To      = Vector2.new(rx, newHitY)
+    hitLine.Visible = true
+    return true
+end
+
+local function checkGone()
+    local pg = tryGet(function() return game:GetService("Players").LocalPlayer.PlayerGui end)
+    return not (pg and tryGet(function() return pg:FindFirstChild("GuitarMinigame") end))
+end
+
+local RS        = game:GetService("RunService")
+local running   = true
+local lastCheck = 0
+
+setupGUI()
+
+local conn = RS.RenderStepped:Connect(function()
+    if not running then return end
+    if not isrbxactive() then return end
+
+    local now = os.clock()
+
+    if now - lastCheck >= 0.5 then
+        lastCheck = now
+        if guiActive then
+            if checkGone() then
+                guiActive = false
+                hideAllESP()
+                releaseAllKeys()
+                return
+            end
+        else
+            setupGUI()
+        end
+    end
+
+    if not guiActive or not hitY then return end
+
+    for lane = 1, 5 do
+        local vk   = LANE_KEYS[lane]
+        local conv = conveyors[lane]
+        local cx   = buttonCentersX[lane] or 0
+
+        for j = 1, MAX_CIRCLES do
+            circles[lane][j].Visible = false
+            tails[lane][j].Visible   = false
+        end
+
+        if tapping[lane] and now >= tapRelease[lane] then
+            keyrelease(vk)
+            tapping[lane] = false
+        end
+
+        if holding[lane] then
+            local h       = holding[lane]
+            local release = not pcall(function() return h.inst.Parent end)
+            if not release then
+                local ap = tryGet(function() return h.inst.AbsolutePosition end)
+                if ap then
+                    local headCY  = ap.Y + HEAD_OFFSET
+                    local holdImg = tryGet(function() return h.inst:FindFirstChild("Hold") end)
+                    local holdAS  = holdImg and tryGet(function() return holdImg.AbsoluteSize end)
+                    local tailH   = (holdAS and holdAS.Y) or 0
+                    if tailH < 4 or (headCY - tailH) >= hitY then release = true end
+                else
+                    release = true
+                end
+            end
+            if release then
+                keyrelease(vk)
+                holding[lane] = nil
+            end
+        end
+
+        if not conv then continue end
+        local children = tryGet(function() return conv:GetChildren() end)
+        if not children then continue end
+
+        local notes = {}
+        local laneF = fired[lane]
+
+        for _, note in ipairs(children) do
+            if note.ClassName ~= "ImageButton" or note.Name ~= "Note" then continue end
+
+            if laneF[note] then
+                if not note.Parent then laneF[note] = nil end
+                continue
+            end
+
+            local ap = tryGet(function() return note.AbsolutePosition end)
+            if not ap then continue end
+
+            local headCY = ap.Y + HEAD_OFFSET
+            local dist   = headCY - hitY
+
+            if dist > PAST_CATCH then continue end
+
+            local holdImg = tryGet(function() return note:FindFirstChild("Hold") end)
+            local holdAS  = holdImg and tryGet(function() return holdImg.AbsoluteSize end)
+            local tailH   = (holdAS and holdAS.Y) or 0
+            local isHold  = tailH > HOLD_MIN_H
+
+            if dist > 0 and not isHold then
+                laneF[note] = true
+                continue
+            end
+
+            notes[#notes + 1] = {
+                note   = note,
+                headCY = headCY,
+                dist   = dist,
+                isHold = isHold,
+                tailH  = tailH,
+            }
+        end
+
+        table.sort(notes, function(a, b) return a.headCY < b.headCY end)
+
+        for j, e in ipairs(notes) do
+            if j > MAX_CIRCLES then break end
+            local c      = circles[lane][j]
+            local t      = tails[lane][j]
+            local onLine = e.dist >= -TOUCH_DIST and e.dist <= PAST_CATCH
+            local col    = onLine and COLOR_ON_LINE or (e.isHold and COLOR_HOLD or LANE_COLORS[lane])
+
+            c.Color    = col
+            c.Filled   = e.isHold and not onLine
+            c.Position = Vector2.new(cx, e.headCY)
+            c.Visible  = true
+
+            if e.isHold and e.tailH > 0 then
+                t.From    = Vector2.new(cx, e.headCY)
+                t.To      = Vector2.new(cx, e.headCY - e.tailH)
+                t.Color   = col
+                t.Visible = true
+            end
+
+            if onLine and not tapping[lane] and not holding[lane] then
+                laneF[e.note] = true
+                if e.isHold then
+                    keypress(vk)
+                    holding[lane] = { inst = e.note }
+                else
+                    keypress(vk)
+                    tapping[lane]    = true
+                    tapRelease[lane] = now + TAP_HOLD_SEC
+                end
+                break
+            end
+        end
+    end
+end)
+
+notify("GuitarAutoplay", "Running", 2)
+
+while running do
+    task.wait(1)
+    if not isrbxactive() then continue end
+end
+
+running = false
+conn:Disconnect()
+releaseAllKeys()
+removeAll()
+notify("GuitarAutoplay", "Stopped", 2)
